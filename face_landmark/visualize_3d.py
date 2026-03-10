@@ -47,12 +47,20 @@ def load_data(file_path: Path):
         if suffix == ".json":
             with open(file_path, 'r', encoding='utf-8') as f:
                 raw_data = json.load(f)
-                # Xử lý cả định dạng mới (dict) và cũ (list)
+                # raw_data is a list of faces
                 for item in raw_data:
-                    if isinstance(item, dict) and "parts" in item:
-                        all_faces_data.append(item)
+                    if isinstance(item, dict):
+                        if "landmarks" in item:
+                            # New format: {"id": 0, "landmarks": [...]}
+                            all_faces_data.append({"all": item["landmarks"], "parts": {}})
+                        elif "parts" in item:
+                            # Other potential format
+                            all_faces_data.append(item)
+                        else:
+                            # Fallback
+                            all_faces_data.append({"all": item, "parts": {}})
                     else:
-                        # Convert list cũ sang format mới để đồng nhất
+                        # Old list format
                         all_faces_data.append({"all": item, "parts": {}})
         elif suffix == ".csv":
             current_face_lms = []
