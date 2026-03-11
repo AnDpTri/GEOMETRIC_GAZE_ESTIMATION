@@ -8,6 +8,7 @@ import cv2
 import sys
 import json
 import torch
+import numpy as np
 from pathlib import Path
 import mediapipe as mp
 
@@ -20,6 +21,20 @@ import config
 from ultralytics import YOLO
 from face_landmark.landmark_model import get_face_mesh
 from face_landmark.face_parts import FACE_PARTS_INDICES, FACE_PARTS_COLORS, MESH_CONNECTIONS, IRIS_CONNECTIONS
+
+def calculate_target_point(p168, p331, p102, k=150.0):
+    """Tính điểm đích của Vector pháp tuyến 3D"""
+    try:
+        p168, p331, p102 = np.array(p168), np.array(p331), np.array(p102)
+        v1 = p331 - p168
+        v2 = p102 - p168
+        # v1 x v2 theo chuẩn không gian Upright Right-Hand-Rule
+        n = np.cross(v1, v2)
+        norm = np.linalg.norm(n)
+        if norm == 0: return p168
+        return p168 + k * (n / norm)
+    except:
+        return p168
 
 def process_batch():
     # 1. Setup Environment
@@ -83,6 +98,7 @@ def process_batch():
                     # 2.1 Categorize and Scale Landmarks
                     parts_json = {}
                     pixel_coords = {}
+                    points_3d = {}
                     
                     for part_name, indices in FACE_PARTS_INDICES.items():
                         part_list = []
@@ -99,6 +115,12 @@ def process_batch():
                                 
                                 part_list.append({"x": px, "y": py, "z": pz})
                                 pixel_coords[idx] = (int(px), int(py))
+                                
+                                # Chuyển đổi sang chuẩn trục Vật lý (Upright 3D) như test.py để tính Vector
+                                std_x = px
+                                std_y = -pz
+                                std_z = -py
+                                points_3d[idx] = (std_x, std_y, std_z)
                         
                         parts_json[part_name] = part_list
                     
@@ -127,6 +149,33 @@ def process_batch():
                             # Vẽ tâm con ngươi to hơn
                             if s_idx in [468, 473]: 
                                 cv2.circle(frame, pixel_coords[s_idx], 2, (255, 255, 255), -1) # Tâm trắng
+
+                    # --- GAZE VECTOR PROJECTION ---
+                    if 168 in points_3d and 331 in points_3d and 102 in points_3d:
+                        p168 = points_3d[168]
+                        p331 = points_3d[331]
+                        p102 = points_3d[102]
+                        
+                        # Tính tọa độ đích trong không gian 3D Vật lý
+                        try:
+                            target_3d = calculate_target_point(p168, p331, p102, k=150.0)
+                            
+                            # Chiếu 3D ngược lại 2D (Chỉ cần lấy X và Z, ném bỏ Y chiều sâu)
+                            target_px = int(target_3d[0])
+                            target_py = int(-target_3d[2])
+                            start_px_168, start_py_168 = pixel_coords[168]
+                            
+                            # Vẽ Tam giác tham chiếu 168-331-102 (Cyan)
+                            pts = np.array([pixel_coords[168], pixel_coords[331], pixel_coords[102]], np.int32)
+                            pts = pts.reshape((-1, 1, 2))
+                            cv2.polylines(frame, [pts], isClosed=True, color=(255, 255, 0), thickness=1)
+                            
+                            # Vẽ Vector Gaze (Vàng) và Điểm đích (Đỏ)
+                            cv2.line(frame, (start_px_168, start_py_168), (target_px, target_py), (0, 255, 255), 2)
+                            cv2.circle(frame, (target_px, target_py), 4, (0, 0, 255), -1)
+                            cv2.circle(frame, (start_px_168, start_py_168), 4, (0, 255, 255), -1)
+                        except Exception as e:
+                            print(f"[!] Lỗi khi vẽ Vector: {e}")
 
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 1)
 
