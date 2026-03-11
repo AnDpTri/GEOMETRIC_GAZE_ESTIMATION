@@ -38,11 +38,26 @@ def load_data(file_path: Path):
         print(f"[✗] Lỗi đọc file: {e}")
         return None
 
+def calculate_target_point(p168, p331, p102, k=0.1):
+    """Tính điểm đích của Vector pháp tuyến từ 3 điểm."""
+    try:
+        p168, p331, p102 = np.array(p168), np.array(p331), np.array(p102)
+        v1 = p331 - p168
+        v2 = p102 - p168
+        # Tích có hướng v1 x v2 theo chuẩn Right-Hand-Rule (với hệ tọa độ mới) sẽ hướng ra phía trước (phía camera)
+        n = np.cross(v1, v2)
+        norm = np.linalg.norm(n)
+        if norm == 0: return p168
+        n_unit = n / norm
+        return p168 + k * n_unit
+    except:
+        return p168
+
 def plot_3d(faces_data, title, show_indices=False):
-    """Render 3D chuyên nghiệp theo bộ phận."""
+    """Render 3D chuyên nghiệp với Gaze Vector."""
     fig = plt.figure(figsize=(12, 10))
     ax = fig.add_subplot(111, projection='3d')
-    fig.patch.set_facecolor('#050505') # Nano black
+    fig.patch.set_facecolor('#050505')
     ax.set_facecolor('#050505')
 
     def bgr_to_hex(bgr):
@@ -62,13 +77,44 @@ def plot_3d(faces_data, title, show_indices=False):
                 if i < len(indices):
                     idx = indices[i]
                     # --- BÍ QUYẾT TẠO 3D THỰC TẾ ---
+                    # MediaPipe: X (Phải+), Y (Xuống+), Z (Gần-)
+                    # Chuẩn 3D Toán học/Matplotlib: X (Ngang/Phải+), Y (Sâu/Tiến+), Z (Cao/Lên+)
                     std_x = lm['x']
-                    std_y = -lm['z'] # Z âm (gần camera) -> Y dương (nhô ra trước)
-                    std_z = -lm['y'] # Y lớn (xuống cằm) -> Z âm (thấp xuống)
+                    std_y = -lm['z'] # Đảo Z thành Y: Z âm (gần camera) -> Y dương (nhô ra trước)
+                    std_z = -lm['y'] # Đảo Y thành Z: Y lớn (xuống cằm) -> Z âm (thấp xuống)
                     
                     all_points_map[idx] = (std_x, std_y, std_z)
 
-        # --- BƯỚC 1: Vẽ điểm (Dots) và Chỉ số (Indices) ---
+        # --- BƯỚC 1: Tính và Vẽ Gaze Vector (Normal Vector từ 168) ---
+        if 168 in all_points_map and 331 in all_points_map and 102 in all_points_map:
+            p168 = all_points_map[168]
+            p331 = all_points_map[331]
+            p102 = all_points_map[102]
+            
+            # Hệ tọa độ hiện tại là Tọa độ Pixel nguyên gốc. 
+            # k_value cần lớn (ví dụ 100-150 pixels) để đường thẳng dài tương xứng trong không gian 3D.
+            k_value = 150
+            target = calculate_target_point(p168, p331, p102, k=k_value)
+            
+            # Vẽ đường thẳng pháp tuyến (Màu Vàng Neon)
+            ax.plot([p168[0], target[0]], [p168[1], target[1]], [p168[2], target[2]], 
+                    c='#FFFF00', linewidth=3, alpha=1.0, label='Normal Vector (Gaze)')
+            
+            # --- VẼ ĐIỂM ĐÍCH (TARGET POINT) ---
+            ax.scatter([target[0]], [target[1]], [target[2]], c='#FF0000', s=30, edgecolors='white', zorder=11, label='Target Point')
+            
+            # --- VẼ TAM GIÁC THAM CHIẾU (168, 331, 102) XANH MỜ ---
+            from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+            verts = [[(p168[0], p168[1], p168[2]), 
+                      (p331[0], p331[1], p331[2]), 
+                      (p102[0], p102[1], p102[2])]]
+            tri = Poly3DCollection(verts, alpha=0.2, facecolors='#00FFFF', edgecolors='#00FFFF', linewidths=0.5)
+            ax.add_collection3d(tri)
+            
+            # Vẽ điểm mồi súng 168 to hơn
+            ax.scatter([p168[0]], [p168[1]], [p168[2]], c='#FFFF00', s=50, edgecolors='white', zorder=10)
+
+        # --- BƯỚC 2: Vẽ điểm và Chỉ số ---
         for part_name, indices in FACE_PARTS_INDICES.items():
             p_xs, p_ys, p_zs = [], [], []
             color = PART_HEX_COLORS.get(part_name, "#ffffff")
@@ -80,31 +126,26 @@ def plot_3d(faces_data, title, show_indices=False):
                     p_xs.append(p[0])
                     p_ys.append(p[1])
                     p_zs.append(p[2])
-                    
-                    # Vẽ số thứ tự nếu yêu cầu
                     if show_indices:
                         ax.text(p[0], p[1], p[2], str(idx), color='white', fontsize=6, alpha=0.7)
             
             if p_xs:
                 ax.scatter(p_xs, p_ys, p_zs, c=color, s=s, edgecolors='white', linewidths=0.2, alpha=0.9)
 
-        # --- BƯỚC 2: Vẽ lưới Tesselation (Màu theo bộ phận) ---
+        # --- BƯỚC 3: Vẽ lưới Tesselation ---
         for conn in MESH_CONNECTIONS:
             s_idx, e_idx = conn
             if s_idx in all_points_map and e_idx in all_points_map:
                 p1, p2 = all_points_map[s_idx], all_points_map[e_idx]
-                
-                # Quyết định màu của cạnh mesh
-                color = "#222222" # Mặc định mờ
+                color = "#222222"
                 for part_name, part_idx_list in FACE_PARTS_INDICES.items():
                     if s_idx in part_idx_list:
                         color = PART_HEX_COLORS.get(part_name, color)
                         break
-                
                 ax.plot([p1[0], p2[0]], [p1[1], p2[1]], [p1[2], p2[2]], 
                         c=color, linewidth=0.3, alpha=0.3)
 
-        # --- BƯỚC 3: Vẽ Iris Connections (Dành cho Gaze) ---
+        # --- BƯỚC 4: Vẽ Iris Connections ---
         for conn in IRIS_CONNECTIONS:
             s_idx, e_idx = conn
             if s_idx in all_points_map and e_idx in all_points_map:
@@ -122,6 +163,8 @@ def plot_3d(faces_data, title, show_indices=False):
     
     # Góc nhìn mặc định (Nhìn chéo từ trên xuống như các phần mềm 3D)
     ax.view_init(elev=20, azim=-45) 
+    
+    # --- CÀI ĐẶT ISOMETRIC 3D (CHỐNG MÉO TỈ LỆ VÀ GÓC KHI XOAY) ---
     x_limits = ax.get_xlim3d()
     y_limits = ax.get_ylim3d()
     z_limits = ax.get_zlim3d()
@@ -155,6 +198,12 @@ def plot_3d(faces_data, title, show_indices=False):
     # Ép khung 3D thành hình lập phương (tỉ lệ 1:1:1) và TẮT TÍNH NĂNG TỰ ĐỘNG CO DÃN
     ax.set_box_aspect([1, 1, 1])
     ax.autoscale(False)
+    
+    # Hiển thị lưới trục mờ để dễ định hướng
+    ax.grid(True, linestyle='--', alpha=0.1)
+    ax.xaxis.pane.fill = False
+    ax.yaxis.pane.fill = False
+    ax.zaxis.pane.fill = False
     
     # --- TÍNH NĂNG ZOOM BẰNG CUỘN CHUỘT ---
     def on_scroll(event):

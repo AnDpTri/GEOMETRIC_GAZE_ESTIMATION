@@ -12,7 +12,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 # ─── THIẾT LẬP CHÍNH (THE HEART) ──────────────────────────────────────────────
 # 'face' : Tự động chạy YOLO Face -> MediaPipe Landmarks
-# 'head' : Chỉ chạy YOLO Head Detection
+# 'head' : Chỉ chạy YOLO Head Detection (Chỉnh YOLO_MODEL_SIZE ở dưới để chọn Nano/Medium)
 MODEL_TYPE = 'face' 
 
 # 'webcam' : Chạy thời gian thực qua camera
@@ -26,10 +26,20 @@ RUN_MODE = 'batch'
 DEVICE = 'auto' 
 
 # ─── CẤU HÌNH YOLOv8 ─────────────────────────────────────────────────────────
-YOLO_MODEL_SIZE = 'n'        # n, s, m, l, x
-YOLO_CONF_THRESHOLD = 0.50
+YOLO_MODEL_SIZE = 'm'        # n, s, m, l, x
+YOLO_CONF_THRESHOLD = 0.30
+
+# Bản đồ các mô hình (để dễ dàng chuyển đổi)
+YOLO_HEAD_MODELS = {
+    'n': BASE_DIR / "yolov8_head" / "yolov8n-head.pt",        # Bản gốc
+    'n_v2': BASE_DIR / "yolov8_head" / "yolov8n-head-v2.pt", # HuggingFace
+    'n_v3': BASE_DIR / "yolov8_head" / "yolov8n-head-v3.pt", # Abcfsa Nano
+    'm': BASE_DIR / "yolov8_head" / "yolov8m-head-v4.pt",    # Abcfsa Medium
+}
+
 YOLO_FACE_MODEL = BASE_DIR / "yolov8_head" / "yolov8n-face.pt"
-YOLO_HEAD_MODEL = BASE_DIR / "yolov8_head" / "yolov8n-head.pt"
+# Tự động chọn mô hình head dựa trên size (mặc định là 'n' nếu không tìm thấy)
+YOLO_HEAD_MODEL = YOLO_HEAD_MODELS.get(YOLO_MODEL_SIZE, YOLO_HEAD_MODELS['n'])
 
 # ─── CẤU HÌNH MEDIAPIPE ──────────────────────────────────────────────────────
 MP_MAX_FACES = 5
