@@ -1,141 +1,137 @@
 import numpy as np
 
 """
-BẢN SAO LƯU LOGIC TÍNH TOÁN HƯỚNG NHÌN (GAZE) VÀ HƯỚNG MẶT (FACE ORIENTATION)
-Dự án: Geometric Gaze Estimation
--------------------------------------------------------------------------
-Tài liệu này chứa toàn bộ các hàm cốt lõi để tính toán vector hướng nhìn 
-dựa trên các điểm mốc (landmarks) từ MediaPipe World Landmarks.
+BẢN SAO LƯU LOGIC CỐT LÕI - GEOMETRIC GAZE ESTIMATION (3D MODEL)
+--------------------------------------------------------------
+Tài liệu này lưu trữ các hàm tính toán hình học quan trọng nhất, 
+tách biệt khỏi phần giao diện (OpenCV/Menu) để bảo soát thuật toán.
+
+Mô hình hiện tại: True 3D Eyeball Model (Raycasting qua Tâm Nhãn Cầu).
 """
 
-def shortest_common_perpendicular(P1, P2, P3, P4):
-    """
-    TÌM GIAO ĐIỂM ẢO (O) CỦA CÁC TRỤC MẮT
-    --------------------------------------
-    Mỗi mắt được giả định có 2 trục (L1: đi qua Landmark 163-157 và L2: 161-154).
-    Giao điểm ảo O được định nghĩa là trung điểm của đoạn vuông góc chung 
-    ngắn nhất giữa hai đường thẳng L1 và L2 này.
-    
-    Tham số:
-        P1, P2: Hai điểm định nghĩa đường thẳng L1 (Vành mắt trên/dưới)
-        P3, P4: Hai điểm định nghĩa đường thẳng L2 (Vành mắt trái/phải)
-    Trả về:
-        O: Tọa độ tâm mắt ảo (3D)
-        u1, u2: Vector chỉ phương đã chuẩn hóa của L1 và L2
-    """
-    # 1. Tính vector chỉ phương
-    u1 = P2 - P1; n1 = np.linalg.norm(u1)
-    if n1 < 1e-6: return None, None, None
-    u1 /= n1
-    
-    u2 = P4 - P3; n2 = np.linalg.norm(u2)
-    if n2 < 1e-6: return None, None, None
-    u2 /= n2
-    
-    # 2. Giải hệ phương trình tìm đoạn vuông góc chung
-    dp = P1 - P3
-    dot12 = np.dot(u1, u2)
-    dot1p = np.dot(u1, dp)
-    dot2p = np.dot(u2, dp)
-    
-    det = 1.0 - dot12**2
-    if det < 1e-7: # Trường hợp 2 đường thẳng song song
-        return (P1 + P3) / 2, u1, u2
+# ------------------------------------------------------------------ #
+#  1. HỆ TỌA ĐỘ KHUÔN MẶT (FACE BASIS)                                #
+# ------------------------------------------------------------------ #
 
-    s = (dot12 * dot2p - dot1p) / det
-    t = (dot2p - dot12 * dot1p) / det
+def step1_get_face_basis(p168, p2, p331, p102):
+    """
+    Tạo bộ ba trực chuẩn [Vf, Rf, Uf] xác định hướng của khuôn mặt.
+    - p168: Ấn đường (Glabella)
+    - p2: Chóp mũi (Nose tip)
+    - p331, p102: Hai điểm mốc hốc mắt (để lấy pháp tuyến mặt)
+    """
+    # 1. Trục Dọc Tham Chiếu (Từ Chóp mũi 2 -> Ấn đường 168)
+    U_ref = p168 - p2
+    U_ref /= (np.linalg.norm(U_ref) + 1e-9)
     
-    # C1, C2 là hai điểm gần nhau nhất trên L1 và L2
-    C1 = P1 + s * u1
-    C2 = P3 + t * u2
+    # 2. Vector Nhìn Thẳng Cơ Sở (Pháp tuyến mặt phẳng mặt)
+    nf = np.cross(p331 - p168, p102 - p168)
+    Vf = -nf / np.linalg.norm(nf) if np.linalg.norm(nf) > 1e-6 else np.array([0,0,-1.])
+    if Vf[2] > 0: Vf = -Vf # Z hướng âm (về phía camera)
     
-    # Tâm O là trung điểm của C1C2
-    O = (C1 + C2) / 2
-    return O, u1, u2
+    # 3. Trục OX - Ngang Mặt (Vuông góc với Dọc tham chiếu và Hướng nhìn)
+    Rf = np.cross(U_ref, Vf)
+    Rf /= (np.linalg.norm(Rf) + 1e-9)
+    
+    # 4. Trục OY - Dọc Mặt (Vuông góc với Ngang mặt và Hướng nhìn)
+    Uf = np.cross(Vf, Rf)
+    Uf /= (np.linalg.norm(Uf) + 1e-9)
+    
+    return Vf, Rf, Uf
 
-def get_local_axes(u1, u2):
-    """
-    THIẾT LẬP HỆ TỌA ĐỘ ĐỊA PHƯƠNG TẠI MẮT (Ox, Oy)
-    ----------------------------------------------
-    Từ hai trục mắt u1 và u2, ta tạo ra hệ tọa độ vuông góc để chiếu con ngươi.
-    Ox (Ngang) và Oy (Dọc) được xác định dựa trên các đường phân giác.
-    
-    Logic phân loại:
-        - b1 = u1 + u2; b2 = u1 - u2
-        - Trục nào có thành phần X (ngang) lớn hơn sẽ là Ox.
-        - Trục còn lại là Oy.
-    """
-    b1 = u1 + u2; b2 = u1 - u2
-    n1, n2 = np.linalg.norm(b1), np.linalg.norm(b2)
-    b1 = b1/n1 if n1 > 1e-6 else u1
-    b2 = b2/n2 if n2 > 1e-6 else u2
-    
-    # MediaPipe World: X+ là Right (nhìn từ camera), Y+ là Up
-    if abs(b1[0]) > abs(b1[1]): # Ưu tiên thành phần X cho trục Ngang
-        ox, oy = b1, b2
-    else: 
-        ox, oy = b2, b1
-        
-    # Chuẩn hóa hướng để Ox luôn hướng sang phải (theo chủ thể) và Oy hướng lên trên
-    if ox[0] > 0: ox = -ox
-    if oy[1] < 0: oy = -oy
-    
-    return ox, oy
+# ------------------------------------------------------------------ #
+#  2. TÂM NHÃN CẦU 3D (EYEBALL CENTER)                                #
+# ------------------------------------------------------------------ #
 
-def process_eye(P1, P2, P3, P4, pupil):
+def step2_find_true_eyeball_center(P_top, P_bottom, P_inner, P_outer, V_face):
     """
-    TÍNH TOÁN TỌA ĐỘ CỰC CỦA CON NGƯƠI (Alpha, d)
-    --------------------------------------------
-    Tính toán xem con ngươi (pupil) đang lệch bao nhiêu so với tâm mắt O 
-    trên hệ tọa độ địa phương (Ox, Oy).
-    
-    Trả về:
-        alpha: Góc lệch (độ)
-        d: Độ dài hình chiếu (độ lệch tâm)
+    Ước lượng tâm nhãn cầu O nằm sâu trong hốc mắt.
+    V_face được dùng để xác định hướng lùi vào (chiều sâu).
     """
-    # 1. Tìm O và các trục địa phương
-    O, u1, u2 = shortest_common_perpendicular(P1, P2, P3, P4)
-    if O is None: return None, None
-    Ox, Oy = get_local_axes(u1, u2)
+    # Tâm bề mặt khe hở (trung bình 4 điểm mí mắt)
+    O_surface = (P_top + P_bottom + P_inner + P_outer) / 4.0
     
-    # 2. Chiếu vị trí con ngươi xuống mặt phẳng mắt
-    V = pupil - O
-    x0 = np.dot(V, Ox) # Tọa độ ngang
-    y0 = np.dot(V, Oy) # Tọa độ dọc
+    # Ước lượng bán kính nhãn cầu (tương đối theo độ rộng mắt)
+    iris_radius_approx = np.linalg.norm(P_outer - P_inner) * 0.4
     
-    # 3. Chuyển sang Alpha (góc) và d (khoảng cách)
-    alpha = np.degrees(np.arctan2(y0, x0))
-    d = np.linalg.norm([x0, y0])
-    return alpha, d
+    # Lùi sâu vào trong (ngược hướng V_face)
+    O_eyeball = O_surface - V_face * iris_radius_approx
+    
+    return O_eyeball
 
-def calculate_gaze_logic(world_landmarks, use_eye=True):
+# ------------------------------------------------------------------ #
+#  3. TÍNH TOÁN GAZE (YAW / PITCH)                                    #
+# ------------------------------------------------------------------ #
+
+def calculate_gaze(world_landmarks):
     """
-    LOGIC TỔNG HỢP: HƯỚNG MẶT + HƯỚNG MẮT
-    -------------------------------------
-    Kết hợp hướng của khuôn mặt và độ lệch của con ngươi để ra vector Gaze cuối cùng.
-    
-    Các bước:
-    1. Tính Alpha (góc) và D (độ lệch) trung bình của 2 mắt.
-    2. Xác định mặt phẳng khuôn mặt (V_face) từ 3 điểm: Gốc mũi (168), 2 hốc mắt (102, 331).
-    3. Tạo hệ trục Face (Front, Right, Up).
-    4. Bẻ hướng vector V_face dựa trên Alpha, D và hệ số S_H, S_V (độ nhạy).
+    Logic Raycasting: Tia nhìn = Đồng tử - Tâm nhãn cầu.
+    world_landmarks: Dict chứa tọa độ 3D (idx: np.array([x,y,z]))
     """
-    # ... Giả định world_landmarks đã được trích xuất tọa độ ...
+    def _pt(idx): return world_landmarks.get(idx)
+
+    p = {'g': _pt(168), 'n': _pt(2), 'a': _pt(331), 'b': _pt(102)}
+    if any(v is None for v in p.values()): return None
+
+    # Lấy hệ trục mặt
+    V_face, Rf, Uf = step1_get_face_basis(p['g'], p['n'], p['a'], p['b'])
     
-    # (A) TRỤC KHUÔN MẶT (Orientation)
-    # V_face: Pháp tuyến của mặt phẳng mặt, hướng về phía trước (Z âm)
-    # Rf: Trục ngang của mặt (Right)
-    # Uf: Trục dọc của mặt (Up) = V_face x Rf
+    # Landmark mắt trái (163, 157, 161, 154 | Đồng tử: 468)
+    # Landmark mắt phải (390, 384, 388, 381 | Đồng tử: 473)
+    eyeL = [_pt(i) for i in (163, 157, 161, 154, 468)]
+    eyeR = [_pt(i) for i in (390, 384, 388, 381, 473)]
     
-    # (B) TÍNH GAZE (Nếu use_eye=True)
-    # Công thức bẻ hướng:
-    # V_final = V_face + d_avg * (cos(alpha)*S_H*Rf + sin(alpha)*S_V*Uf)
-    # Trong đó S_H=18, S_V=25 là các hệ số nhạy cho trục Ngang và Dọc.
+    if any(pt is None for pt in eyeL) or any(pt is None for pt in eyeR):
+        return None
+
+    # Tính hướng nhìn từng mắt
+    O_L = step2_find_true_eyeball_center(eyeL[0], eyeL[1], eyeL[2], eyeL[3], V_face)
+    gaze_L = (eyeL[4] - O_L); gaze_L /= np.linalg.norm(gaze_L)
+
+    O_R = step2_find_true_eyeball_center(eyeR[0], eyeR[1], eyeR[2], eyeR[3], V_face)
+    gaze_R = (eyeR[4] - O_R); gaze_R /= np.linalg.norm(gaze_R)
+
+    # Trung bình cộng vector hướng nhìn
+    V_final = (gaze_L + gaze_R) / 2.0
+    V_final /= np.linalg.norm(V_final)
     
-    # (C) SMOOTHING (EMA - Nếu chạy trong vòng lặp)
-    # V_smooth = alpha * V_new + (1 - alpha) * V_old
+    # Chuyển sang Yaw/Pitch (độ)
+    # Yaw: Xoay ngang (arctan2 X / -Z)
+    # Pitch: Ngước lên/xuống (arcsin -Y)
+    pitch = np.degrees(np.arcsin(-V_final[1]))
+    yaw = np.degrees(np.arctan2(V_final[0], -V_final[2]))
     
-    pass # Hàm này trong script chính thực hiện các phép tính vector tương tự
+    return yaw, pitch, V_final
+
+# ------------------------------------------------------------------ #
+#  4. TRACKING LOGIC (KALMAN + IOU)                                   #
+# ------------------------------------------------------------------ #
+
+class KalmanBoxTracker:
+    """Theo dõi Bounding Box bằng bộ lọc Kalman để mượt khung cắt (Crop)."""
+    def __init__(self, bbox):
+        from filterpy.kalman import KalmanFilter
+        self.kf = KalmanFilter(dim_x=7, dim_z=4)
+        # Ma trận chuyển trạng thái F, quan sát H (chi tiết xem trong code chính)
+        # [x, y, s, r, vx, vy, vs]
+        self.kf.x[:4] = self._box_to_z(bbox)
+        self.id = -1 # Sẽ được gán bởi FaceTracker
+        self.smooth_gaze = None
+
+    def _box_to_z(self, b):
+        w, h = b[2]-b[0], b[3]-b[1]
+        return np.array([b[0]+w/2., b[1]+h/2., w*h, w/float(h)]).reshape((4,1))
+
+    # predict() và update() thực hiện dự báo vị trí hộp ở frame tiếp theo
+
+def calculate_iou(b1, b2):
+    """Giao trên diện tích (Intersection over Union) để khớp ID."""
+    xA, yA = max(b1[0], b2[0]), max(b1[1], b2[1])
+    xB, yB = min(b1[2], b2[2]), min(b1[3], b2[3])
+    inter = max(0, xB - xA) * max(0, yB - yA)
+    area1, area2 = (b1[2]-b1[0])*(b1[3]-b1[1]), (b2[2]-b2[0])*(b2[3]-b2[1])
+    return inter / float(area1 + area2 - inter + 1e-6)
 
 if __name__ == "__main__":
-    print("Đây là script backup logic hình học. Vui lòng tham khảo code bên trong.")
+    print("BACKUP LOGIC: Đã cập nhật mô hình 3D Eyeball chuẩn.")
+    print("Sử dụng các hàm step1, step2 và calculate_gaze cho các dự án khác.")

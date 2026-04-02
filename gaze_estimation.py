@@ -43,14 +43,12 @@ for d in [INPUT_VIDEO, OUTPUT_BATCH, OUTPUT_VIS_2D, OUTPUT_VIS_3D, OUTPUT_WEBCAM
 CAMERA_ID    = 0
 GLOBAL_CONFIG = {
     "show_ids": False,     # Mặc định TẮT Landmark IDs
-    "smooth_alpha": 0.6,   # 0.1: mượt/trễ, 0.9: nhạy/rung
+    "smooth_alpha": 0.4,   # 0.1: mượt/trễ, 0.9: nhạy/rung
     "use_eye_gaze": True, # Mặc định Chỉ Mặt
     "force_device": "cuda",# Mặc định chạy CUDA
     "multi_face": True,    # Mặc định theo dõi đa đối tượng (Robust)
-    "yolo_conf": 0.7,     # Ngưỡng tin cậy YOLO
-    "roi_padding": 0.355,  # Hệ số lề vùng cắt (Crop padding)
-    "S_H": 28.0,           # Độ nhạy ngang
-    "S_V": 12.35           # Độ nhạy dọc
+    "yolo_conf": 0.5,     # Ngưỡng tin cậy YOLO
+    "roi_padding": 0.45,  # Hệ số lề vùng cắt (Crop padding)
 }
 
 # Màu sắc mặc định cho toàn bộ (Green - BGR)
@@ -168,135 +166,158 @@ def make_face_mesh(static=False):
         max_num_faces          = 1,
         refine_landmarks       = True,
         min_detection_confidence = 0.5,
-        min_tracking_confidence  = 0.5,
+        min_tracking_confidence  = 0.60, # Tăng lên để bám landmark chặt chẽ hơn
     )
+
+def preprocess_face(crop, min_dim=384):
+    """
+    Two-Stage Eye Refinement - Bước tiền xử lý ảnh khuôn mặt:
+    1. Upscale: Đảm bảo crop đủ lớn (≥min_dim) để MediaPipe có nhiều pixel hơn 
+       cho vùng mắt, giúp landmark iris/eyelid chính xác hơn đáng kể.
+    2. CLAHE: Tăng cường tương phản kênh Lightness (LAB) để nổi bật viền mắt.
+    3. Sharpen: Làm sắc nét cạnh mí mắt/mống mắt để MediaPipe snap chính xác hơn.
+    
+    QUAN TRỌNG: Hàm trả về (processed_crop, orig_w, orig_h) để caller 
+    có thể dùng orig_w/h cho build_coords, tránh lỗi mapping tọa độ pixel.
+    """
+    import cv2
+    import numpy as np
+    if crop is None or crop.size == 0: return crop, 0, 0
+    
+    orig_h, orig_w = crop.shape[:2]
+    
+    # 1. UPSCALE (Two-Stage Eye Refinement core)
+    # Nếu crop quá nhỏ, upscale lên để MediaPipe có nhiều pixel/mắt hơn.
+    # Kích thước gốc (orig_w, orig_h) phải được trả về để build_coords dùng,
+    # vì MediaPipe chuẩn hóa landmark về [0,1] relative to input → cần map về đúng orig frame size.
+    current_max = max(orig_h, orig_w)
+    if current_max < min_dim:
+        scale = min_dim / current_max
+        new_w, new_h = int(orig_w * scale), int(orig_h * scale)
+        crop = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+    
+    # 2. CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
+    cl = clahe.apply(l)
+    limg = cv2.merge((cl, a, b))
+    crop_proc = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+    
+    # 3. Sharpening (Làm nét nhẹ)
+    kernel = np.array([[0, -0.5, 0], [-0.5, 3, -0.5], [0, -0.5, 0]])
+    crop_proc = cv2.filter2D(crop_proc, -1, kernel)
+    
+    return crop_proc, orig_w, orig_h
+
 
 def get_iris_connections():
     import mediapipe as mp
     return mp.solutions.face_mesh.FACEMESH_IRISES
 
+
 KEY_IDS = [163, 157, 161, 154, 468, 390, 384, 388, 381, 473, 168]
 
 # ------------------------------------------------------------------ #
-#  HÌNH HỌC                                                           #
+#  HÌNH HỌC TÍNH TOÁN GAZE (BÁM SÁT 4 BƯỚC LÝ THUYẾT)                  #
 # ------------------------------------------------------------------ #
-def get_face_basis(p_g, p_n, p_a, p_b):
-    """
-    Returns local axes (V_face, Rf, Uf) for a face.
-    Construction Order:
-    1. Up_ref = 168 - 2
-    2. Vf = Initial Normal (cross sides)
-    3. Rf (OX) = cross(Up_ref, Vf)
-    4. Uf (OY) = cross(Vf, Rf)
-    """
-    # 1. Reference Up vector from Nose to Glabella
-    U_ref = p_g - p_n; U_ref /= (np.linalg.norm(U_ref) + 1e-9)
-    
-    # 2. OZ (Forward): Initial face normal (cross product of sides)
-    nf = np.cross(p_a - p_g, p_b - p_g)
-    Vf = -nf/np.linalg.norm(nf) if np.linalg.norm(nf) > 1e-6 else np.array([0,0,-1.])
-    if Vf[2] > 0: Vf = -Vf # Points "forward" relative to face (MediaPipe Z- is Forward)
-    
-    # 3. OX (Right/Ngang mặt): Cross of Reference Up and Forward
-    Rf = np.cross(U_ref, Vf); Rf /= (np.linalg.norm(Rf) + 1e-9)
-    
-    # 4. OY (Up/Dọc mặt): Perfectly orthogonal Up from Forward and Right
-    Uf = np.cross(Vf, Rf); Uf /= (np.linalg.norm(Uf) + 1e-9)
-    
-    return Vf, Rf, Uf
-
-def shortest_common_perpendicular(P1, P2, P3, P4):
-    import numpy as np
-    """
-    Tìm giao điểm ảo (O): Là trung điểm của đoạn vuông góc chung ngắn nhất giữa L1 (P1-P2) và L2 (P3-P4).
-    """
-    u1 = P2 - P1; n1 = np.linalg.norm(u1)
-    if n1 < 1e-6: return None, None, None
-    u1 /= n1
-    u2 = P4 - P3; n2 = np.linalg.norm(u2)
-    if n2 < 1e-6: return None, None, None
-    u2 /= n2
-    
-    # dp = P1 - P3
-    dp = P1 - P3
-    dot12 = np.dot(u1, u2)
-    dot1p = np.dot(u1, dp)
-    dot2p = np.dot(u2, dp)
-    
-    det = 1.0 - dot12**2
-    if det < 1e-7: # Song song
-        return (P1 + P3) / 2, u1, u2
-
-    s = (dot12 * dot2p - dot1p) / det
-    t = (dot2p - dot12 * dot1p) / det
-    
-    C1 = P1 + s * u1
-    C2 = P3 + t * u2
-    O = (C1 + C2) / 2
-    return O, u1, u2
-
-def get_local_axes(u1, u2):
-    import numpy as np
-    """
-    Thiết lập Hệ tọa độ Địa phương (Ox, Oy) bằng hai đường phân giác của L1, L2.
-    Phân loại dựa trên thành phần chiếm ưu thế để đảm bảo Ox là Ngang và Oy là Dọc.
-    """
-    b1 = u1 + u2; b2 = u1 - u2 # Hai đường phân giác (chưa chuẩn hóa)
-    n1, n2 = np.linalg.norm(b1), np.linalg.norm(b2)
-    b1 = b1/n1 if n1 > 1e-6 else u1
-    b2 = b2/n2 if n2 > 1e-6 else u2
-    
-    # Phân loại trục dựa trên thành phần chiếm ưu thế (X hay Y)
-    # (Hệ MediaPipe World: X+ Right, Y+ Up)
-    if abs(b1[0]) > abs(b1[1]): # b1 thiên về phương ngang hơn
-        ox, oy = b1, b2
-    else: # b1 thiên về phương dọc hơn
-        ox, oy = b2, b1
-        
-    # CHUẨN HÓA HƯỚNG: Ox sang TRÁI hốc mắt (Subject's Right), Oy lên TRÊN (Subject's Up)
-    # LƯU Ý: Landmark 102 (Right) có X nhỏ hơn 331 (Left), nên Subject's Right là hướng X âm.
-    if ox[0] > 0: ox = -ox
-    if oy[1] < 0: oy = -oy
-    
-    return ox, oy
-
-def process_eye(P1, P2, P3, P4, pupil):
-    import numpy as np
-    O, u1, u2 = shortest_common_perpendicular(P1, P2, P3, P4)
-    if O is None: return None, None
-    Ox, Oy = get_local_axes(u1, u2)
-    V = pupil - O
-    
-    # Chiếu pupil xuống mặt phẳng (Ox, Oy) qua O và tính tọa độ x0, y0
-    x0 = np.dot(V, Ox)
-    y0 = np.dot(V, Oy)
-    
-    alpha = np.degrees(np.arctan2(y0, x0))
-    d = np.linalg.norm([x0, y0])
-    return alpha, d
 
 def _pt(world, idx):
     import numpy as np
     return np.array(world[idx]) if idx in world else None
 
+def step1_get_face_basis(p168, p2, p331, p102):
+    import numpy as np
+    """
+    BƯỚC 1: HỆ TỌA ĐỘ KHUÔN MẶT
+    Tạo bộ ba trực chuẩn [Vf (Nhìn thẳng), Rf (Ngang mặt), Uf (Dọc mặt)]
+    """
+    # 1. Trục Dọc Tham Chiếu (Từ Chóp mũi 2 -> Ấn đường 168)
+    U_ref = p168 - p2
+    U_ref /= (np.linalg.norm(U_ref) + 1e-9)
+    
+    # 2. Vector Nhìn Thẳng Cơ Sở (Vuông góc với mặt phẳng chứa 168, 331, 102)
+    nf = np.cross(p331 - p168, p102 - p168)
+    Vf = -nf / np.linalg.norm(nf) if np.linalg.norm(nf) > 1e-6 else np.array([0,0,-1.])
+    if Vf[2] > 0: Vf = -Vf # Z hướng âm (về phía camera)
+    
+    # 3. Trục OX - Ngang Mặt (Vuông góc với Dọc tham chiếu và Hướng nhìn)
+    Rf = np.cross(U_ref, Vf)
+    Rf /= (np.linalg.norm(Rf) + 1e-9)
+    
+    # 4. Trục OY - Dọc Mặt (Vuông góc với Ngang mặt và Hướng nhìn)
+    Uf = np.cross(Vf, Rf)
+    Uf /= (np.linalg.norm(Uf) + 1e-9)
+    
+    return Vf, Rf, Uf
+
+def step2_find_true_eyeball_center(P_top, P_bottom, P_inner, P_outer, V_face):
+    import numpy as np
+    """
+    BƯỚC 2: TÂM NHÃN CẦU LÙI SÂU TRONG HỐC MẮT
+    """
+    # Tâm bề mặt khe hở
+    O_surface = (P_top + P_bottom + P_inner + P_outer) / 4.0
+    
+    # Ước lượng bán kính nhãn cầu (tương đối theo khoảng cách 2 khoé ngoài-trong của mắt)
+    # MediaPipe scale là chuẩn khoảng 3cm. 
+    iris_radius_approx = np.linalg.norm(P_outer - P_inner) * 0.4
+    
+    # Lùi sâu (ngược hướng V_face, vì V_face đang hướng đâm về phía camera Z âm)
+    # Điều này tạo một tâm khớp xoay ổn định.
+    O_eyeball = O_surface - V_face * iris_radius_approx
+    
+    return O_eyeball
+
 def calculate_gaze(world):
+    import numpy as np
+    """
+    BƯỚC 3-4: RAYCAST TRỰC TIẾP QUA TÂM ĐỒNG TỬ 3D
+    """
     use_eye = GLOBAL_CONFIG.get("use_eye_gaze", True)
-    pts_ids = dict(g=168, n=2, a=331, b=102)
-    if use_eye: pts_ids.update(l1=163,l2=157,l3=161,l4=154,lp=468,r1=390,r2=384,r3=388,r4=381,rp=473)
-    p = {k: _pt(world, v) for k, v in pts_ids.items()}
+    
+    p = {
+        'g': _pt(world, 168), 'n': _pt(world, 2), 
+        'a': _pt(world, 331), 'b': _pt(world, 102)
+    }
     if any(v is None for v in p.values()): return None, None, None, None
 
-    V_face, Rf, Uf = get_face_basis(p['g'], p['n'], p['a'], p['b'])
-    if not use_eye: return None, None, p['g'], V_face
+    # Lấy Hướng Mặt (cần dùng V_face để ước lượng chiều sâu)
+    V_face, Rf, Uf = step1_get_face_basis(p['g'], p['n'], p['a'], p['b'])
+    
+    if not use_eye: 
+        return None, None, p['g'], V_face
 
-    aL, dL = process_eye(p['l1'], p['l2'], p['l3'], p['l4'], p['lp'])
-    aR, dR = process_eye(p['r1'], p['r2'], p['r3'], p['r4'], p['rp'])
-    if aL is None or aR is None: return None, None, None, None
+    # Mắt trái (Left: 163, 157, 161, 154 | Pupil: 468)
+    eyeL = [_pt(world, i) for i in (163, 157, 161, 154, 468)]
+    eyeR = [_pt(world, i) for i in (390, 384, 388, 381, 473)]
+    
+    if any(pt is None for pt in eyeL) or any(pt is None for pt in eyeR):
+        return None, None, None, None
 
-    al_avg, d_avg = (aL + aR)/2.0, (dL + dR)/2.0
-    ar = np.radians(al_avg)
-    V_final = V_face + d_avg * (np.cos(ar) * GLOBAL_CONFIG["S_H"] * Rf + np.sin(ar) * GLOBAL_CONFIG["S_V"] * Uf)
-    return al_avg, d_avg, p['g'], V_final / np.linalg.norm(V_final)
+    # Mắt Trái
+    O_L = step2_find_true_eyeball_center(eyeL[0], eyeL[1], eyeL[2], eyeL[3], V_face)
+    gaze_vec_L = eyeL[4] - O_L
+    nL = np.linalg.norm(gaze_vec_L)
+    if nL > 1e-6: gaze_vec_L /= nL
+
+    # Mắt Phải
+    O_R = step2_find_true_eyeball_center(eyeR[0], eyeR[1], eyeR[2], eyeR[3], V_face)
+    gaze_vec_R = eyeR[4] - O_R
+    nR = np.linalg.norm(gaze_vec_R)
+    if nR > 1e-6: gaze_vec_R /= nR
+
+    # Tổng hợp tia Gaze mượt mà không bị lật góc (Wrap-around 180 deg)
+    V_final = (gaze_vec_L + gaze_vec_R) / 2.0
+    V_final /= np.linalg.norm(V_final)
+    
+    # Mô phỏng lại output để HUD hiển thị (Yaw / Pitch thay cho Alpha / Distance)
+    # Yaw: hướng xoay trái phải. Pitch: ngước lên xuống. (Z âm hướng nhìn ta)
+    pitch = np.degrees(np.arcsin(-V_final[1])) # Y của mp hướng xuống, nên lật lại để pitch âm là nhìn xuống
+    yaw = np.degrees(np.arctan2(V_final[0], -V_final[2]))
+    
+    return yaw, pitch, p['g'], V_final
+
 
 def build_coords(face_lms, world_lms, x1, y1, w_c, h_c):
     import numpy as np
@@ -321,10 +342,11 @@ def draw_arrow(frame, px, V, w_c, h_c, color=(0,0,255)):
     """Vẽ tia hướng nhìn từ điểm 168 (-----°)."""
     if 168 not in px: return
     s = px[168]
-    # Phóng đại Vx, Vy để vẽ hướng trên ảnh. Kéo dãn gấp 2 lần (2.0)
-    L = min(w_c, h_c) * 2.0
+    # Phóng đại Vx, Vy để vẽ hướng trên ảnh. Kéo dãn 0.6 lần (đã giảm xuống 30% từ 2.0)
+    L = min(w_c, h_c) * 0.6
     # Vx+ (Right world) -> Right image. Vy+ (Up world) -> Up image (Giảm Y px).
     e = (int(s[0] + V[0]*L), int(s[1] - V[1]*L))
+
     
     # Thay mũi tên bằng đường line + chấm tròn ở cuối
     cv2.line(frame, s, e, color, 2)
@@ -341,17 +363,21 @@ def draw_iris(frame, px):
             cv2.circle(frame, px[i], 3, (255,255,255), -1)
 
 def draw_eye_geometry(frame, px, wc):
-    """Vẽ L1, L2, O, Ox, Oy cho 2 mắt (chế độ Vis 2D)."""
+    """Vẽ tĩnh mạch/quỹ đạo nhãn cầu (chế độ Vis 2D)."""
+    p168, p2_w, p331, p102 = _pt(wc, 168), _pt(wc, 2), _pt(wc, 331), _pt(wc, 102)
+    if any(x is None for x in [p168, p2_w, p331, p102]): return
+    V_face, _, _ = step1_get_face_basis(p168, p2_w, p331, p102)
+
     for ids in [(163,157,161,154,468), (390,384,388,381,473)]:
         p1,p2,p3,p4,_ = [_pt(wc, i) for i in ids]
         if any(x is None for x in [p1,p2,p3,p4]): continue
-        O, u1, u2 = shortest_common_perpendicular(p1,p2,p3,p4)
-        if O is None: continue
-        Ox, Oy = get_local_axes(u1, u2)
+        
+        O = step2_find_true_eyeball_center(p1,p2,p3,p4, V_face)
+
         if ids[0] in px and ids[2] in px:
             cv2.line(frame, px[ids[0]], px[ids[1]], (255,200,0), 2)
             cv2.line(frame, px[ids[2]], px[ids[3]], (255,200,0), 2)
-        # Ox, Oy arrows (scaled visually)
+        
         def _wc2px(pt3d, ref_idx, wc, px):
             if ref_idx not in wc or ref_idx not in px: return None
             ref_w = np.array(wc[ref_idx])
@@ -359,30 +385,29 @@ def draw_eye_geometry(frame, px, wc):
             dp = pt3d - ref_w
             sc = 800
             return (int(ref_p[0] + dp[0]*sc), int(ref_p[1] + dp[1]*sc))
+            
         origin_px = px.get(ids[0])
         if origin_px:
-            scale = 0.04
-            ex = _wc2px(O + Ox*scale, ids[0], wc, px)
-            ey = _wc2px(O + Oy*scale, ids[0], wc, px)
             op = _wc2px(O, ids[0], wc, px)
             if op:
-                cv2.drawMarker(frame, op, (0,0,255), cv2.MARKER_CROSS, 12, 2)
-                if ex: cv2.arrowedLine(frame, op, ex, (0,200,0), 2, tipLength=0.35)
-                if ey: cv2.arrowedLine(frame, op, ey, (200,0,200), 2, tipLength=0.35)
+                cv2.drawMarker(frame, op, (0,0,255), cv2.MARKER_CROSS, 8, 2)
+                if ids[2] in px and ids[3] in px:
+                    radius_2d = int(np.linalg.norm(np.array(px[ids[2]]) - np.array(px[ids[3]])) * 0.45)
+                    cv2.circle(frame, op, radius_2d, (200, 0, 200), 1)
 
 def draw_key_ids(frame, px):
     for i in KEY_IDS:
         if i in px:
             cv2.putText(frame, str(i), px[i], cv2.FONT_HERSHEY_PLAIN, 0.9, (0,255,0), 1)
 
-def draw_hud(frame, fps, alpha, dist, show_mesh, show_ids):
+def draw_hud(frame, fps, yaw, pitch, show_mesh, show_ids):
     h, w = frame.shape[:2]
     ov = frame.copy()
     cv2.rectangle(ov, (10,10), (330,135), (0,0,0), -1)
     cv2.addWeighted(ov, 0.4, frame, 0.6, 0, frame)
     cv2.putText(frame, f"FPS: {fps:.1f}", (20,35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
-    cv2.putText(frame, f"Alpha: {alpha:.1f} deg" if alpha else "Alpha: --", (20,62), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
-    cv2.putText(frame, f"Dist:  {dist:.4f}" if dist else "Dist:  --", (20,87), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
+    cv2.putText(frame, f"Yaw:   {yaw:.1f} deg" if yaw is not None else "Yaw:   --", (20,62), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
+    cv2.putText(frame, f"Pitch: {pitch:.1f} deg" if pitch is not None else "Pitch: --", (20,87), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
     cv2.putText(frame, f"Mesh:{'ON' if show_mesh else 'OFF'} IDs:{'ON' if show_ids else 'OFF'}", (20,112), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200,200,200), 1)
     cv2.putText(frame, "Q/ESC Quit | S Save | M Mesh | I IDs", (10,h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180,180,180), 1)
 
@@ -393,7 +418,20 @@ def process_frame(frame, tracked_faces, tracker=None, face_mesh=None, show_mesh=
     oh, ow = frame.shape[:2]
     rows = []
     for box, tid in (tracked_faces or []):
+        # Mặc định lấy box thô từ YOLO
         x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+        
+        # Use per-ID dedicated FaceMesh if tracker exists, else fallback to face_mesh
+        trk = tracker.get_tracker(tid) if tracker else None
+        
+        # Nếu đang tracking, ƯU TIÊN lấy box đã được làm mượt (smoothed) bởi Kalman Filter
+        # Việc này giúp khuôn cắt (crop) không bị nháy, từ đó MediaPipe Face Mesh ổn định hơn rất nhiều.
+        if trk:
+            sx1, sy1, sx2, sy2 = map(int, trk.get_state())
+            # Chỉ ghi đè nếu tọa độ hộp hợp lệ (không bị vượt biên quá lố)
+            if sx2 > sx1 and sy2 > sy1:
+                x1, y1, x2, y2 = max(0, sx1), max(0, sy1), min(ow, sx2), min(oh, sy2)
+                
         # Padded Crop for Face Mesh (Direct ROI)
         bw, bh = x2-x1, y2-y1
         p_val = GLOBAL_CONFIG.get("roi_padding", 0.355)
@@ -402,6 +440,10 @@ def process_frame(frame, tracked_faces, tracker=None, face_mesh=None, show_mesh=
         cx2, cy2 = min(ow, x2+pad_w), min(oh, y2+pad_h)
         crop = frame[cy1:cy2, cx1:cx2]
         if crop.size == 0: continue
+        
+        # Apply Accuracy Enhancements (CLAHE + Sharpening)
+        crop, orw, orh = preprocess_face(crop)
+        
         cv2.rectangle(frame, (x1,y1), (x2,y2), FACE_COLOR, 1)
 
         # Use per-ID dedicated FaceMesh if tracker exists, else fallback to face_mesh
@@ -410,25 +452,26 @@ def process_frame(frame, tracked_faces, tracker=None, face_mesh=None, show_mesh=
         if not mesh_obj: continue
 
         mpr = mesh_obj.process(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+
         if not mpr.multi_face_landmarks: continue
-        px, wc_d = build_coords(mpr.multi_face_landmarks[0], getattr(mpr, 'multi_face_world_landmarks', [None])[0], cx1, cy1, crop.shape[1], crop.shape[0])
+        px, wc_d = build_coords(mpr.multi_face_landmarks[0], getattr(mpr, 'multi_face_world_landmarks', [None])[0], cx1, cy1, orw, orh)
 
         if vis2d: (draw_iris(frame, px), draw_eye_geometry(frame, px, wc_d))
         if show_ids or vis2d: draw_key_ids(frame, px)
 
-        al, d, _, Vf = calculate_gaze(wc_d)
+        yaw, pitch, _, Vf = calculate_gaze(wc_d)
         if Vf is not None:
             if tracker:
                 prev_v = tracker.get_smooth_gaze(tid)
                 if prev_v is not None:
-                    alpha = GLOBAL_CONFIG.get("smooth_alpha", 0.3)
-                    Vf = (alpha*Vf + (1-alpha)*prev_v); Vf /= np.linalg.norm(Vf)
+                    smooth = GLOBAL_CONFIG.get("smooth_alpha", 0.3)
+                    Vf = (smooth*Vf + (1-smooth)*prev_v); Vf /= np.linalg.norm(Vf)
                 tracker.set_smooth_gaze(tid, Vf)
             
             draw_arrow(frame, px, Vf, crop.shape[1], crop.shape[0], color=FACE_COLOR)
-            txt = f"A:{al:.1f} D:{d:.4f}" if al is not None else "FACE MODE"
+            txt = f"Y:{yaw:.1f} P:{pitch:.1f}" if yaw is not None else "FACE MODE"
             cv2.putText(frame, txt, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, FACE_COLOR, 1)
-            rows.append({"alpha_degrees": al or 0, "distance_to_O": d or 0, "final_gaze_vector": f"({Vf[0]:.4f}, {Vf[1]:.4f}, {Vf[2]:.4f})"})
+            rows.append({"yaw_deg": yaw or 0, "pitch_deg": pitch or 0, "final_gaze_vector": f"({Vf[0]:.4f}, {Vf[1]:.4f}, {Vf[2]:.4f})"})
     return rows, None
 
 # ------------------------------------------------------------------ #
@@ -528,7 +571,7 @@ def run_webcam():
                 else: rows = []
 
             if rows:
-                last_a, last_d = rows[-1]['alpha_degrees'], rows[-1]['distance_to_O']
+                last_a, last_d = rows[-1]['yaw_deg'], rows[-1]['pitch_deg']
 
             fps = 1/(time.time()-prev_t+1e-9); prev_t = time.time()
             draw_hud(frame, fps, last_a, last_d, show_mesh, show_ids)
@@ -613,108 +656,235 @@ def run_vis3d():
             cx1, cy1 = max(0, x1-pad_w), max(0, y1-pad_h)
             cx2, cy2 = min(ow, x2+pad_w), min(oh, y2+pad_h)
             crop = frame[cy1:cy2, cx1:cx2]
-            
+            crop, orw, orh = preprocess_face(crop)
             mpr = fm.process(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
             if not mpr.multi_face_landmarks: continue
 
             wlms = getattr(mpr, 'multi_face_world_landmarks', None)
             wlms0 = wlms[0] if wlms else None
-            _, wc_d = build_coords(mpr.multi_face_landmarks[0], wlms0, cx1, cy1, crop.shape[1], crop.shape[0])
+            _, wc_d = build_coords(mpr.multi_face_landmarks[0], wlms0, cx1, cy1, orw, orh)
 
             fig = go.Figure()
 
             # 1. Landmark mặt (vùng trên)
-            # Mesh xám mờ + text ID (nếu GLOBAL_CONFIG bật)
-            upper_ids = [idx for idx in range(468) if idx in wc_d and (idx < 10 or (33 <= idx < 160) or (263 <= idx < 390) or idx in KEY_IDS)]
-            pts = np.array([wc_d[idx] for idx in upper_ids])
+            log_data = [f"=== GAZE 3D CALC LOG: {path.name} ==="]
             
-            mode_3d = 'markers+text' if GLOBAL_CONFIG["show_ids"] else 'markers'
-            txt_3d  = [str(idx) for idx in upper_ids] if GLOBAL_CONFIG["show_ids"] else None
+            # Pre-retrieve basis and final gaze to avoid repeats
+            p168_wc = _pt(wc_d, 168)
+            p2_wc = _pt(wc_d, 2)
+            p331_wc = _pt(wc_d, 331)
+            p102_wc = _pt(wc_d, 102)
             
-            fig.add_trace(go.Scatter3d(
-                x=pts[:,0], y=pts[:,1], z=pts[:,2], 
-                mode=mode_3d, 
-                marker=dict(size=2, color='gray', opacity=0.4), 
-                text=txt_3d,
-                textposition="top center",
-                textfont=dict(size=7, color='black'),
-                name='Face Mesh'
-            ))
+            p_basis = all(p is not None for p in [p168_wc, p2_wc, p331_wc, p102_wc])
+            V_face = None
+            if p_basis:
+                V_face, _, _ = step1_get_face_basis(p168_wc, p2_wc, p331_wc, p102_wc)
+            
+            yaw, pitch, _, Vf = calculate_gaze(wc_d)
+            st_yaw = f"{yaw:.1f}" if yaw is not None else "--"
+            st_pitch = f"{pitch:.1f}" if pitch is not None else "--"
 
-            # 2. Các thành phần hốc mắt
+            # 2. Các thành phần hố mắt & Iris (Nhóm 2)
             for eye_idx, eye_ids in enumerate([(163,157,161,154,468),(390,384,388,381,473)]):
                 ep = [_pt(wc_d, idx) for idx in eye_ids[:4]]
                 if any(p is None for p in ep): continue
-                p1, p2, p3, p4 = ep
-                # L1, L2 (Cyan)
-                fig.add_trace(go.Scatter3d(x=[p1[0], p2[0]], y=[p1[1], p2[1]], z=[p1[2], p2[2]], mode='lines', line=dict(color='cyan', width=3), name='Hốc mắt' if eye_idx==0 else "", showlegend=eye_idx==0))
-                fig.add_trace(go.Scatter3d(x=[p3[0], p4[0]], y=[p3[1], p4[1]], z=[p3[2], p4[2]], mode='lines', line=dict(color='cyan', width=3), showlegend=False))
+                p1, p2, p3, p4 = ep # 163/390(outer), 157/384(top), 161/388(inner), 154/381(bottom)
                 
-                O,u1,u2 = shortest_common_perpendicular(p1,p2,p3,p4)
-                if O is not None:
+                # Kiểm tra độ mở của mắt (Eye Openness)
+                eye_open_dist = np.linalg.norm(p2 - p4)
+                closed_thresh = 0.0055 
+                is_closed = eye_open_dist < closed_thresh
+                eye_label = "LEFT" if eye_idx == 0 else "RIGHT"
+                
+                # L1, L2 (Cyan cho mắt trái, Lime cho mắt phải)
+                color_eye = 'cyan' if eye_idx == 0 else 'lime'
+                # Vẽ Hố mắt (4 điểm chính)
+                fig.add_trace(go.Scatter3d(x=[p1[0], p3[0]], y=[p1[1], p3[1]], z=[p1[2], p3[2]], mode='lines', line=dict(color=color_eye, width=3), name=f'Trục hốc mắt {eye_label} [2]', meta='2', showlegend=(eye_idx==0)))
+                fig.add_trace(go.Scatter3d(x=[p2[0], p4[0]], y=[p2[1], p4[1]], z=[p2[2], p4[2]], mode='lines', line=dict(color=color_eye, width=3), meta='2', showlegend=False))
+                
+                # VẼ VIỀN MẮT TOÀN BỘ (Khóe mắt - Nhóm 2)
+                import mediapipe as mp
+                eye_conns = mp.solutions.face_mesh.FACEMESH_LEFT_EYE if eye_idx == 0 else mp.solutions.face_mesh.FACEMESH_RIGHT_EYE
+                lx, ly, lz = [], [], []
+                for s, e in eye_conns:
+                    if s in wc_d and e in wc_d:
+                        lx.extend([wc_d[s][0], wc_d[e][0], None])
+                        ly.extend([wc_d[s][1], wc_d[e][1], None])
+                        lz.extend([wc_d[s][2], wc_d[e][2], None])
+                if lx:
+                    fig.add_trace(go.Scatter3d(
+                        x=lx, y=ly, z=lz, 
+                        mode='lines', line=dict(color=color_eye, width=2), 
+                        name=f'Khóe mắt {eye_label} [2]', meta='2', showlegend=False
+                    ))
+                
+                # VẼ IRIS 3D (Nếu có)
+                for conn in get_iris_connections():
+                    s, e = conn
+                    if s in wc_d and e in wc_d:
+                        ps, pe = wc_d[s], wc_d[e]
+                        fig.add_trace(go.Scatter3d(
+                            x=[ps[0], pe[0]], y=[ps[1], pe[1]], z=[ps[2], pe[2]], 
+                            mode='lines', line=dict(color='yellow', width=2), 
+                            opacity=0.8, meta='2', showlegend=False
+                        ))
+
+                if V_face is not None:
+                    O = step2_find_true_eyeball_center(p2, p4, p3, p1, V_face) # Order: Top, Bottom, Inner, Outer
+                    
+                    log_data.append(f"\n[{eye_label} Eye] | OpenDist: {eye_open_dist:.5f} {'(CLOSED)' if is_closed else '(OPEN)'}")
+                    log_data.append(f"  Eyeball Center (O): {O}")
+                    
                     fig.add_trace(go.Scatter3d(
                         x=[O[0]], y=[O[1]], z=[O[2]], 
-                        mode='markers+text', 
-                        marker=dict(size=6, symbol='x', color='magenta'), 
-                        text=["O (Eyeball)"],
-                        textposition="top right",
-                        name='Tâm ảo O' if eye_idx==0 else "", 
+                        mode='markers', marker=dict(size=4, symbol='diamond', color='magenta', opacity=0.6), 
+                        name=f'Tâm Nhãn Cầu {eye_label} [3]' if eye_idx==0 else "", meta='3',
                         showlegend=eye_idx==0
                     ))
-                    ox, oy = get_local_axes(u1, u2)
-                    sc = 0.03
-                    # Ox (Green), Oy (Blue)
-                    fig.add_trace(go.Scatter3d(x=[O[0], O[0]+ox[0]*sc], y=[O[1], O[1]+ox[1]*sc], z=[O[2], O[2]+ox[2]*sc], mode='lines', line=dict(color='green', width=5), name='Trục Ox (Ngang)' if eye_idx==0 else "", showlegend=eye_idx==0))
-                    fig.add_trace(go.Scatter3d(x=[O[0], O[0]+oy[0]*sc], y=[O[1], O[1]+oy[1]*sc], z=[O[2], O[2]+oy[2]*sc], mode='lines', line=dict(color='blue', width=5), name='Trục Oy (Dọc)' if eye_idx==0 else "", showlegend=eye_idx==0))
 
-                    # Pupil projection
+                    # Pupil
                     pupil = _pt(wc_d, eye_ids[4])
                     if pupil is not None:
+                        # Thêm điểm đồng tử với ID
                         fig.add_trace(go.Scatter3d(
                             x=[pupil[0]], y=[pupil[1]], z=[pupil[2]], 
-                            mode='markers+text', 
-                            marker=dict(size=5, color='darkblue'), 
-                            text=[str(eye_ids[4])],
-                            textposition="bottom center",
-                            name='Đồng tử' if eye_idx==0 else "", 
-                            showlegend=eye_idx==0
+                            mode='markers+text', marker=dict(size=5, color='darkblue'), 
+                            text=[str(eye_ids[4])], textposition="bottom center",
+                            name=f'Đồng tử {eye_label} [2]', meta='2', showlegend=False
                         ))
-                        V = pupil - O
-                        proj_pt = O + np.dot(V, ox)*ox + np.dot(V, oy)*oy
-                        fig.add_trace(go.Scatter3d(x=[pupil[0], proj_pt[0]], y=[pupil[1], proj_pt[1]], z=[pupil[2], proj_pt[2]], mode='lines', line=dict(color='red', width=2, dash='dash'), showlegend=False))
+                        
+                        # Ray from Center through pupil
+                        gaze = (pupil - O)
+                        g_norm = np.linalg.norm(gaze)
+                        gaze /= (g_norm + 1e-9)
+                        
+                        # Màu tia nhìn: Xám nếu nhắm, màu đậm nếu mở
+                        ray_color = 'gray' if is_closed else ('deepskyblue' if eye_idx==0 else 'lawngreen')
+                        ray_dash = 'dash' if is_closed else 'solid'
+                        ray_name = f'Tia {eye_label} {"(Nhắm)" if is_closed else ""} [3]'
+                        
+                        proj_pt = O + gaze * 0.05
+                        fig.add_trace(go.Scatter3d(
+                            x=[O[0], proj_pt[0]], y=[O[1], proj_pt[1]], z=[O[2], proj_pt[2]], 
+                            mode='lines', line=dict(color=ray_color, width=4, dash=ray_dash), 
+                            name=ray_name, meta='3'
+                        ))
 
-            # 3. Face Basis (168) & Final Gaze
-            p168 = _pt(wc_d, 168)
-            alpha, d, _, Vf = calculate_gaze(wc_d)
-            if p168 is not None and 2 in wc_d:
-                nf, rf, uf = get_face_basis(p168, wc_d[2], wc_d[331], wc_d[102])
+            # 3. Face Basis & Final Gaze (Nhóm 3)
+            if p_basis:
+                nf, rf, uf = step1_get_face_basis(p168_wc, p2_wc, p331_wc, p102_wc)
                 s_f = 0.08
-                for v, c, n in [(nf, 'black', 'Pháp tuyến'), (rf, 'orange', 'Ngang mặt'), (uf, 'purple', 'Dọc mặt')]:
-                    fig.add_trace(go.Scatter3d(x=[p168[0], p168[0]+v[0]*s_f], y=[p168[1], p168[1]+v[1]*s_f], z=[p168[2], p168[2]+v[2]*s_f], mode='lines', line=dict(color=c, width=6), name=n))
+                for v, c, n in [(nf, 'black', 'Pháp tuyến (Front) [3]'), (rf, 'orange', 'Ngang mặt (Right) [3]'), (uf, 'purple', 'Dọc mặt (Up) [3]')]:
+                    fig.add_trace(go.Scatter3d(x=[p168_wc[0], p168_wc[0]+v[0]*s_f], y=[p168_wc[1], p168_wc[1]+v[1]*s_f], z=[p168_wc[2], p168_wc[2]+v[2]*s_f], mode='lines', line=dict(color=c, width=6), name=n, meta='3'))
+                
                 if Vf is not None:
-                    fig.add_trace(go.Scatter3d(x=[p168[0], p168[0]+Vf[0]*0.18], y=[p168[1], p168[1]+Vf[1]*0.18], z=[p168[2], p168[2]+Vf[2]*0.18], mode='lines', line=dict(color='red', width=10), name='HƯỚNG NHÌN'))
+                    # Final Gaze from Glabella (168) - Reduced to 30% (from 0.18 to 0.054)
+                    fig.add_trace(go.Scatter3d(
+                        x=[p168_wc[0], p168_wc[0]+Vf[0]*0.054], y=[p168_wc[1], p168_wc[1]+Vf[1]*0.054], z=[p168_wc[2], p168_wc[2]+Vf[2]*0.054], 
+                        mode='lines', line=dict(color='red', width=10), 
+                        name='HƯỚNG NHÌN TỔNG HỢP [3]', meta='3'
+                    ))
+
+                    
+                    log_data.append(f"\n[FINAL GAZE]")
+                    log_data.append(f"  V_final: {Vf}")
+                    log_data.append(f"  Yaw:   {st_yaw}° | Pitch: {st_pitch}°\n")
+
+            # Write log to file
+            log_out = OUTPUT_VIS_3D / f"3d_log_{path.stem}.txt"
+            with open(log_out, "w", encoding="utf-8") as f:
+                f.write("\n".join(log_data))
+
+            # 4. Landmark mặt (Nhóm 1)
+            # Dùng FACEMESH_TESSELATION để vẽ lưới tam giác liên kết toàn bộ mặt
+            import mediapipe as mp
+            x_lines, y_lines, z_lines = [], [], []
+            for start, end in mp.solutions.face_mesh.FACEMESH_TESSELATION:
+                if start in wc_d and end in wc_d:
+                    x_lines.extend([wc_d[start][0], wc_d[end][0], None])
+                    y_lines.extend([wc_d[start][1], wc_d[end][1], None])
+                    z_lines.extend([wc_d[start][2], wc_d[end][2], None])
+            
+            if x_lines:
+                fig.add_trace(go.Scatter3d(
+                    x=x_lines, y=y_lines, z=z_lines, 
+                    mode='lines', line=dict(color='gray', width=1), 
+                    opacity=0.3, name='Lưới Khuôn Mặt [1]', meta='1', hoverinfo='skip'
+                ))
+            
+            # Mesh xám mờ + text ID rời
+            upper_ids = [idx for idx in range(468) if idx in wc_d and (idx < 10 or (33 <= idx < 160) or (263 <= idx < 390) or idx in KEY_IDS)]
+            pts = np.array([wc_d[idx] for idx in upper_ids])
+            if pts.size > 0:
+                mode_3d = 'markers+text' if GLOBAL_CONFIG["show_ids"] else 'markers'
+                txt_3d  = [str(idx) for idx in upper_ids] if GLOBAL_CONFIG["show_ids"] else None
+                fig.add_trace(go.Scatter3d(
+                    x=pts[:,0], y=pts[:,1], z=pts[:,2], 
+                    mode=mode_3d, marker=dict(size=2, color='gray', opacity=0.4), 
+                    text=txt_3d, textposition="top center", textfont=dict(size=7, color='black'),
+                    name='Face Mesh Markers [1]', meta='1'
+                ))
 
             # Layout config
-            # Camera Up: Y+ (Up). View from Front (Z-).
             camera = dict(eye=dict(x=0, y=0, z=-1.5), up=dict(x=0, y=1, z=0))
-            
-            st_alpha = f"{alpha:.1f}" if alpha is not None else "--"
-            st_d = f"{d:.4f}" if d is not None else "--"
-            
             fig.update_layout(
                 scene=dict(
                     camera=camera,
-                    xaxis=dict(range=[pts[:,0].min()-0.05, pts[:,0].max()+0.05], autorange=False, title='X (Ngang)'),
-                    yaxis=dict(range=[pts[:,1].min()-0.05, pts[:,1].max()+0.05], autorange=False, title='Y (Dọc)'),
-                    zaxis=dict(range=[pts[:,2].min()-0.05, pts[:,2].max()+0.05], autorange=False, title='Z (Sâu)'),
+                    xaxis=dict(range=[pts[:,0].min()-0.05, pts[:,0].max()+0.05] if pts.size > 0 else None, autorange=False, title='X (Ngang)'),
+                    yaxis=dict(range=[pts[:,1].min()-0.05, pts[:,1].max()+0.05] if pts.size > 0 else None, autorange=False, title='Y (Dọc)'),
+                    zaxis=dict(range=[pts[:,2].min()-0.05, pts[:,2].max()+0.05] if pts.size > 0 else None, autorange=False, title='Z (Sâu)'),
                     aspectmode='cube'
                 ),
-                title=f"3D Gaze Analysis: {path.name} | Alpha: {st_alpha}° | D: {st_d}",
+                title=f"3D Gaze Analysis: {path.name} | Gaze: ({st_yaw}°, {st_pitch}°)",
                 margin=dict(l=0, r=0, b=0, t=40)
             )
-            
+
+            # Thêm HDSD lên góc trên biểu đồ
+            fig.add_annotation(
+                text="<b>Bấm phím 1</b>: Lưới Mặt | <b>2</b>: Mắt & Đồng tử | <b>3</b>: Tính toán Gaze",
+                x=0.01, y=0.98, xref="paper", yref="paper", showarrow=False,
+                font=dict(size=14, color="white"), bgcolor="rgba(0,0,0,0.6)", borderpad=6
+            )
+
             out_html = OUTPUT_VIS_3D / f"3d_{path.stem}.html"
             fig.write_html(str(out_html))
+            
+            # Tiêm thêm mã JS ngầm vào cuối tệp HTML để xử lý sự kiện gõ phím '1','2','3'
+            custom_js = """
+            <script>
+            document.addEventListener('keydown', function(event) {
+                var key = event.key;
+                if (!['1', '2', '3'].includes(key)) return;
+                
+                var plots = document.getElementsByClassName('plotly-graph-div');
+                for (var p = 0; p < plots.length; p++) {
+                    var gd = plots[p];
+                    if (!gd || !gd.data) continue;
+                    
+                    var update = {visible: []};
+                    var indices = [];
+                    for (var i = 0; i < gd.data.length; i++) {
+                        if (gd.data[i].meta === key) {
+                            indices.push(i);
+                            var currentVis = gd.data[i].visible;
+                            // Nút chuyển trạng thái huyền ảo: nếu đang bật thì ẩn (legendonly hoặc false), ngược lại bật true
+                            if (currentVis === undefined || currentVis === true) {
+                                update.visible.push('legendonly'); 
+                            } else {
+                                update.visible.push(true);
+                            }
+                        }
+                    }
+                    if (indices.length > 0) {
+                        Plotly.restyle(gd, update, indices);
+                    }
+                }
+            });
+            </script>
+            """
+            with open(out_html, 'a', encoding='utf-8') as html_file:
+                html_file.write(custom_js)
+
             print(f"    [✓] Đã tạo HTML: {out_html.name}")
 
         except Exception as e:
@@ -733,12 +903,35 @@ def run_video():
     v_files = []
     for ext in v_exts:
         v_files.extend(list(INPUT_VIDEO.glob(ext)))
+    v_files.sort()
     
+    to_process = []
     if v_files:
-        print(f"  [*] Tìm thấy {len(v_files)} video trong {INPUT_VIDEO}")
-        to_process = v_files
-    else:
-        print(f"  [*] Không tìm thấy video trong {INPUT_VIDEO}. Mở hộp thoại chọn file...")
+        print(f"\n  [*] Danh sách video trong {INPUT_VIDEO.name}:")
+        for i, f in enumerate(v_files):
+            print(f"      {i+1}. {f.name}")
+        print(f"      A. Chạy tất cả ({len(v_files)} video)")
+        print(f"      F. Chọn file khác từ máy tính...")
+        print(f"      0. Quay lại")
+        
+        choice = input("\n  [?] Lựa chọn (1-{0}, A, F, 0): ".format(len(v_files))).strip().upper()
+        
+        if choice == '0': return
+        elif choice == 'A': to_process = v_files
+        elif choice == 'F': pass # Sẽ mở tkinter bên dưới
+        else:
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(v_files):
+                    to_process = [v_files[idx]]
+                else: 
+                    print("  [!] Số thứ tự không hợp lệ."); return
+            except ValueError:
+                print("  [!] Lựa chọn không hợp lệ."); return
+    
+    if not to_process:
+        # Nếu chưa có video nào được chọn (folder trống HOẶC người dùng chọn F)
+        print(f"  [*] Mở hộp thoại chọn file...")
         import tkinter as tk
         from tkinter import filedialog
         root = tk.Tk(); root.withdraw()
@@ -746,6 +939,7 @@ def run_video():
         root.destroy()
         if not vpath: print("  [!] Không có file nào được chọn."); return
         to_process = [Path(vpath)]
+
 
     dev = get_device()
     print(f"  [*] Khởi tạo Face Detection trên: {dev.upper()}")
@@ -879,20 +1073,16 @@ def run_settings_menu():
     while True:
         print(f"\n{'='*40}\n  CÀI ĐẶT THAM SỐ\n{'='*40}")
         print(f"  1. Smooth Alpha [{GLOBAL_CONFIG['smooth_alpha']}]")
-        print(f"  2. S_H [{GLOBAL_CONFIG['S_H']}]")
-        print(f"  3. S_V [{GLOBAL_CONFIG['S_V']}]")
-        print(f"  4. YOLO Conf [{GLOBAL_CONFIG['yolo_conf']}]")
-        print(f"  5. ROI Padding [{GLOBAL_CONFIG['roi_padding']}]")
+        print(f"  2. YOLO Conf [{GLOBAL_CONFIG['yolo_conf']}]")
+        print(f"  3. ROI Padding [{GLOBAL_CONFIG['roi_padding']}]")
         print(f"  0. Quay lại")
         c = input("\nChọn: ").strip()
         if c == '0': break
         try:
             v = float(input("Nhập giá trị mới: "))
             if c == '1': GLOBAL_CONFIG['smooth_alpha'] = v
-            elif c == '2': GLOBAL_CONFIG['S_H'] = v
-            elif c == '3': GLOBAL_CONFIG['S_V'] = v
-            elif c == '4': GLOBAL_CONFIG['yolo_conf'] = v
-            elif c == '5': GLOBAL_CONFIG['roi_padding'] = v
+            elif c == '2': GLOBAL_CONFIG['yolo_conf'] = v
+            elif c == '3': GLOBAL_CONFIG['roi_padding'] = v
             print("  [OK]")
         except: print("  [!]")
 
@@ -913,10 +1103,10 @@ def get_menu():
 ║  3  Vis 2D (debug hình học trên ảnh)     ║
 ║  4  Vis 3D (mô hình 3D tương tác)        ║
 ║  5  Video  (xử lý file video)            ║
-║  6  Cấu hình Landmark IDs [{st_ids}]         ║
-║  7  Chế độ Gaze [{st_gaze}]            ║
+║  6  Cấu hình Landmark IDs [{st_ids}]     ║
+║  7  Chế độ Gaze [{st_gaze}]              ║
 ║  8  Thiết bị [{dev}]                     ║
-║  9  Chế độ [{st_mode}] (Robust/Fast)      ║
+║  9  Chế độ [{st_mode}] (Robust/Fast)     ║
 ║  S  Cài đặt tham số nâng cao             ║
 ║  0  Thoát                                ║
 ╚══════════════════════════════════════════╝
