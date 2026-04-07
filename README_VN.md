@@ -1,47 +1,31 @@
-# GEOMETRIC GAZE ESTIMATION (Multi-Platform)
-Dự án ước lượng hướng mắt (Gaze Estimation) dựa trên hình học không gian, hỗ trợ đa nền tảng (PC/CUDA & Raspberry Pi 4).
+# GEOMETRIC GAZE ESTIMATION (Clone & Run Version)
+Dự án ước lượng hướng mắt (Gaze Estimation) "Tiện Lợi Tuyệt Đối" - Hỗ trợ tốt nhất cho Windows và Raspberry Pi 4 (Python 3.13 / Debian Trixie).
 
-## 🚀 Tính năng nổi bật
-- **Auto-Hardware Detection**: Tự động nhận diện phần cứng (PC/RPi 4) để cấu hình engine tối ưu nhất.
-- **Pure ONNX Mode**: Hỗ trợ chạy trên Python 3.13 (Debian Trixie) bằng engine ONNX internally.
-- **Hybrid Engine**: Tự động chuyển đổi giữa MediaPipe (Fast) và ONNX (Robust/Trixie).
-- **Visualization**: Hỗ trợ xem 2D debug và 3D tương tác.
+## 🚀 CHẠY NHANH TRONG 1-CLICK (SIÊU TIỆN LỢI)
 
-## 📁 Cấu trúc thư mục chuẩn
-- `models/`: Chứa tất cả tệp trọng số (`.pt`, `.onnx`).
-- `input/`: Nơi chứa ảnh/video đầu vào.
-- `output/`: Kết quả xử lý (ảnh, video, dữ liệu CSV).
-- `venv/`: Môi trường ảo (sau khi cài đặt).
+### 💻 1. Dành cho Windows (PC/CUDA)
+- Clone dự án về máy.
+- Kích đúp chuột vào tệp: **`RUN_FAST.bat`**
+- Xong! Hệ thống sẽ tự động cài đặt và mở chương trình.
 
-## 🛠️ Hướng dẫn cài đặt "Clone & Run"
-
-### 1. Trên Windows (PC/CUDA)
-- Mở Terminal tại thư mục dự án.
-- Chạy lệnh:
-  ```cmd
-  setup_pc.bat
-  ```
-
-### 2. Trên Raspberry Pi 4 (Debian 12/13/Trixie)
-- Mở Terminal.
-- Chạy lệnh:
+### 🍓 2. Dành cho Raspberry Pi 4 (Linux/Debian)
+- Clone dự án về máy.
+- Gõ duy nhất lệnh sau tại Terminal:
   ```bash
-  sudo bash setup_rpi.sh
+  bash RUN_FAST.sh
   ```
-- **Lưu ý**: Trên Debian Trixie (Python 3.13), hệ thống sẽ tự động dùng chế độ **Pure ONNX Mode** để đảm bảo không lỗi.
+- Xong! Mọi thứ từ cài đặt đến khởi động đều tự động 100%.
 
-## 🖥️ Cách chạy chương trình
-Sau khi cài đặt xong, hãy kích hoạt môi trường ảo và chạy:
-```bash
-# Windows
-venv\Scripts\activate
-python gaze_estimation.py
+---
 
-# Raspberry Pi / Linux
-source venv/bin/activate
-python3 gaze_estimation.py
-```
+## 📁 Cấu trúc dự án sạch
+- `models/`: Toàn bộ các mô hình AI (.pt, .onnx) - Tải về là có ngay.
+- `input/`: Nơi để ảnh và video mẫu.
+- `output/`: Nơi xem báo cáo và video kết quả.
 
-## 📋 Yêu cầu thư viện (Requirements)
-- **PC**: `requirements.txt` (Hỗ trợ GPU/CUDA).
-- **Raspberry Pi**: `requirements_rpi.txt` (Tối ưu cho CPU ARM/TFLite).
+## 🛠️ Tính năng "Tiện lợi tuyệt đối"
+- **Tự động dò phần cứng**: Tự nhận diện PC hay Pi để chạy nhanh nhất.
+- **Pure ONNX Mode**: Tự động kích hoạt khi chạy trên Python 3.13 (Debian Trixie) - Không lo lỗi MediaPipe.
+- **Tài liệu đầy đủ**: Chi tiết sơ đồ tại `PROJECT_ARCHITECTURE.md`.
+
+**Chào mừng bạn đến với thế giới "Clone & Run"!** 🚀🫡
