@@ -1,0 +1,11 @@
+=== GAZE 3D CALC LOG: hoamnbucu.png ===
+
+[LEFT Eye] | OpenDist: 0.01479 (OPEN)
+  Eyeball Center (O): [    0.49672    -0.45837   -0.085695]
+
+[RIGHT Eye] | OpenDist: 0.01111 (OPEN)
+  Eyeball Center (O): [    0.60474    -0.56123    0.059504]
+
+[FINAL GAZE]
+  V_final: [    0.51543   -0.073131     -0.8538]
+  Yaw:   31.1° | Pitch: 4.2°

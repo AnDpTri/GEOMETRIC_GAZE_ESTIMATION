@@ -30,26 +30,28 @@ ENV/
 .vscode/
 .idea/
 
-# Input/Output data
-input/
-output/
-data/
+# Input/Output data (Full Project Sync)
+!input/
+!output/
+!data/
+!models/
 
-# Model weights (Large files)
-*.pt
+# Model weights (Included in models/ directory)
+!models/*.pt
+!models/*.onnx
 *.pth
-*.onnx
 *.weights
 *.tflite
 
-# Media
+# Media (Allow only small samples in input/output)
 *.mp4
 *.avi
 *.mkv
 *.mov
-*.jpg
-*.png
-*.gif
+!input/*.jpg
+!input/*.png
+!output/*.csv
+!output/*.jpg
 
 # Exclude specific non-source files
 !requirements.txt

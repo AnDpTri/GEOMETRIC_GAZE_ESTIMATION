@@ -1,0 +1,11 @@
+=== GAZE 3D CALC LOG: lowqua_eye_close.png ===
+
+[LEFT Eye] | OpenDist: 0.00926 (OPEN)
+  Eyeball Center (O): [    0.35879    -0.44964  -0.0048994]
+
+[RIGHT Eye] | OpenDist: 0.01078 (OPEN)
+  Eyeball Center (O): [    0.62756    -0.43459  -0.0062789]
+
+[FINAL GAZE]
+  V_final: [   0.075343    -0.40471    -0.91134]
+  Yaw:   4.7° | Pitch: 23.9°

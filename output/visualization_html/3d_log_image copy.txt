@@ -1,0 +1,11 @@
+=== GAZE 3D CALC LOG: image copy.png ===
+
+[LEFT Eye] | OpenDist: 0.02059 (OPEN)
+  Eyeball Center (O): [    0.21547    -0.35494    0.093188]
+
+[RIGHT Eye] | OpenDist: 0.01974 (OPEN)
+  Eyeball Center (O): [    0.47483    -0.36462   -0.043414]
+
+[FINAL GAZE]
+  V_final: [  -0.020617     0.12755    -0.99162]
+  Yaw:   -1.2° | Pitch: -7.3°
