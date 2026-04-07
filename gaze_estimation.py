@@ -21,7 +21,6 @@ from pathlib import Path
 from scipy.optimize import linear_sum_assignment
 
 # Note: Heavy libraries (mediapipe, ultralytics, plotly, filterpy, onnxruntime) are lazy-loaded unless specified.
-import sys
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
 
@@ -73,6 +72,7 @@ GLOBAL_CONFIG = {
 
 def auto_setup_hardware():
     """Tự động điều chỉnh cấu hình dựa trên phần cứng thực tế."""
+    global GLOBAL_CONFIG
     arch = platform.machine().lower()
     is_rpi = is_raspberry_pi()
     
@@ -108,7 +108,8 @@ FACE_COLOR = (0, 255, 0)
 class ThreadedCamera:
     """Luồng đọc camera độc lập để giữ frame luôn mới nhất."""
     def __init__(self, camera_id=0, width=1280, height=720):
-        self.cap = cv2.VideoCapture(camera_id, cv2.CAP_DSHOW if sys.platform == "win32" else cv2.VideoCapture)
+        backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
+        self.cap = cv2.VideoCapture(camera_id, backend)
         if not self.cap.isOpened():
             self.cap = cv2.VideoCapture(camera_id)
             
