@@ -15,19 +15,35 @@ Phím tắt (chế độ Webcam):
 =============================================================
 """
 
-import cv2, sys, csv, time, torch
+import cv2, sys, csv, time, torch, threading
 import numpy as np
 from pathlib import Path
 from scipy.optimize import linear_sum_assignment
 
-# Note: Heavy libraries (mediapipe, ultralytics, plotly, filterpy) are lazy-loaded unless specified.
+# Note: Heavy libraries (mediapipe, ultralytics, plotly, filterpy, onnxruntime) are lazy-loaded unless specified.
+import sys
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
 
 # ------------------------------------------------------------------ #
-#  CẤU HÌNH                                                           #
+#  CẤU HÌNH & NHẬN DIỆN PHẦN CỨNG                                     #
 # ------------------------------------------------------------------ #
-BASE_DIR        = Path(__file__).resolve().parent   # d:\MMPOSE
+import platform
+def is_raspberry_pi():
+    try:
+        m = Path('/proc/device-tree/model')
+        return m.exists() and "Raspberry Pi" in m.read_text()
+    except: return False
+
+def get_hardware_info():
+    arch = platform.machine().lower()
+    is_rpi = is_raspberry_pi()
+    return "Raspberry Pi 4" if is_rpi else f"Desktop ({arch.upper()})"
+
+BASE_DIR        = Path(__file__).resolve().parent
 YOLO_FACE_MODEL = BASE_DIR / "yolov8_head" / "yolov8n-face.pt"
 
+# Folder setup
 INPUT_DIR       = BASE_DIR / "input"
 INPUT_VIDEO     = INPUT_DIR / "video"
 OUTPUT_BATCH    = BASE_DIR / "output" / "face"
@@ -40,19 +56,191 @@ DATA_DIR        = BASE_DIR / "data"  / "face"
 for d in [INPUT_VIDEO, OUTPUT_BATCH, OUTPUT_VIS_2D, OUTPUT_VIS_3D, OUTPUT_WEBCAM, OUTPUT_VIDEO, DATA_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
-CAMERA_ID    = 0
+CAMERA_ID     = 0
 GLOBAL_CONFIG = {
-    "show_ids": False,     # Mặc định TẮT Landmark IDs
-    "smooth_alpha": 0.4,   # 0.1: mượt/trễ, 0.9: nhạy/rung
-    "use_eye_gaze": True, # Mặc định Chỉ Mặt
-    "force_device": "cuda",# Mặc định chạy CUDA
-    "multi_face": True,    # Mặc định theo dõi đa đối tượng (Robust)
-    "yolo_conf": 0.5,     # Ngưỡng tin cậy YOLO
-    "roi_padding": 0.45,  # Hệ số lề vùng cắt (Crop padding)
+    "show_ids": False,
+    "smooth_alpha": 0.4,
+    "use_eye_gaze": True,
+    "force_device": "cuda",
+    "multi_face": True,
+    "yolo_conf": 0.5,
+    "roi_padding": 0.45,
+    "detect_interval": 5,
+    "high_fps_mode": False,
+    "use_onnx": True,
+    "hw_detected": get_hardware_info()
 }
+
+def auto_setup_hardware():
+    """Tự động điều chỉnh cấu hình dựa trên phần cứng thực tế."""
+    arch = platform.machine().lower()
+    is_rpi = is_raspberry_pi()
+    
+    if is_rpi or "arm" in arch or "aarch64" in arch:
+        # Tối ưu cho Raspberry Pi / ARM
+        GLOBAL_CONFIG["force_device"] = "cpu"
+        GLOBAL_CONFIG["use_onnx"] = False      # Ưu tiên MediaPipe TFLite trên ARM
+        GLOBAL_CONFIG["high_fps_mode"] = True   # Giảm tải tài nguyên
+        GLOBAL_CONFIG["detect_interval"] = 8    # Giảm tần suất YOLO
+        GLOBAL_CONFIG["multi_face"] = False     # Mặc định Fast mode cho mượt
+        print(f"  [AUTO] Phát hiện Raspberry Pi/ARM. Đã cấu hình chế độ Low-Power.")
+    else:
+        # Tối ưu cho Desktop (Ưu tiên GPU nếu có)
+        if torch.cuda.is_available():
+            GLOBAL_CONFIG["force_device"] = "cuda"
+            GLOBAL_CONFIG["use_onnx"] = True
+            print(f"  [AUTO] Phát hiện Desktop + CUDA. Đã bật GPU Acceleration.")
+        else:
+            GLOBAL_CONFIG["force_device"] = "cpu"
+            GLOBAL_CONFIG["use_onnx"] = False
+            print(f"  [AUTO] Phát hiện Desktop CPU-only. Fallback về MediaPipe.")
+
+# Gọi tự động khi khởi động
+auto_setup_hardware()
 
 # Màu sắc mặc định cho toàn bộ (Green - BGR)
 FACE_COLOR = (0, 255, 0)
+
+# ------------------------------------------------------------------ #
+#  THREADED UTILITIES                                                #
+# ------------------------------------------------------------------ #
+
+class ThreadedCamera:
+    """Luồng đọc camera độc lập để giữ frame luôn mới nhất."""
+    def __init__(self, camera_id=0, width=1280, height=720):
+        self.cap = cv2.VideoCapture(camera_id, cv2.CAP_DSHOW if sys.platform == "win32" else cv2.VideoCapture)
+        if not self.cap.isOpened():
+            self.cap = cv2.VideoCapture(camera_id)
+            
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1) # Giới hạn buffer phần cứng
+        
+        self.grabbed, self.frame = self.cap.read()
+        self.started = False
+        self.read_lock = threading.Lock()
+
+    def start(self):
+        if self.started: return self
+        self.started = True
+        self.thread = threading.Thread(target=self.update, args=(), daemon=True)
+        self.thread.start()
+        return self
+
+    def update(self):
+        while self.started:
+            grabbed, frame = self.cap.read()
+            with self.read_lock:
+                self.grabbed = grabbed
+                self.frame = frame
+
+    def read(self):
+        with self.read_lock:
+            frame = self.frame.copy() if self.frame is not None else None
+            return self.grabbed, frame
+
+    def stop(self):
+        self.started = False
+        if hasattr(self, 'thread'):
+            self.thread.join()
+        self.cap.release()
+
+class ONNXGazeEngine:
+    """
+    Engine xử lý Inference sử dụng ONNX Runtime (GPU/CUDA).
+    Hỗ trợ YOLOv8 Face Detection và FaceMesh Refined (478 pts).
+    """
+    def __init__(self):
+        import onnxruntime as ort
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        
+        yolo_path = BASE_DIR / "c_ver" / "yolov8n-face.onnx"
+        mesh_path = BASE_DIR / "c_ver" / "facemesh_refined.onnx"
+        
+        print(f"  [*] ONNX Engine: Đang khởi tạo trên {providers[0]}...")
+        self.ort_yolo = ort.InferenceSession(str(yolo_path), providers=providers)
+        self.ort_mesh = ort.InferenceSession(str(mesh_path), providers=providers)
+        
+        # Metadata
+        self.yolo_input = self.ort_yolo.get_inputs()[0].name
+        self.mesh_input = self.ort_mesh.get_inputs()[0].name
+        self.mesh_outputs = [o.name for o in self.ort_mesh.get_outputs()]
+
+    def detect(self, frame, conf_threshold=0.5):
+        """Chạy YOLOv8 ONNX và trả về boxes định dạng tương đồng ultralytics."""
+        h, w = frame.shape[:2]
+        blob = cv2.resize(frame, (640, 640))
+        blob = blob.transpose(2, 0, 1).astype(np.float32) / 255.0
+        blob = np.expand_dims(blob, axis=0)
+        
+        outputs = self.ort_yolo.run(None, {self.yolo_input: blob})
+        # YOLOv8 output: [1, 5, 8400] -> [x, y, w, h, conf]
+        out = outputs[0][0]
+        
+        boxes, confs = [], []
+        for i in range(out.shape[1]):
+            conf = out[4, i]
+            if conf > conf_threshold:
+                cx, cy, bw, bh = out[0, i], out[1, i], out[2, i], out[3, i]
+                x1, y1 = (cx - bw/2) * (w/640), (cy - bh/2) * (h/640)
+                x2, y2 = (cx + bw/2) * (w/640), (cy + bh/2) * (h/640)
+                boxes.append([x1, y1, x2, y2])
+                confs.append(float(conf))
+        
+        if not boxes: return []
+        
+        # NMS
+        indices = cv2.dnn.NMSBoxes(boxes, confs, conf_threshold, 0.45)
+        
+        # Giả lập object .xyxy tương đương ultralytics để reuse code
+        class FakeBox:
+            def __init__(self, x): self.xyxy = [torch.tensor(x)]
+            
+        final_boxes = []
+        for i in indices:
+            idx = i[0] if isinstance(i, (list, np.ndarray)) else i
+            final_boxes.append(FakeBox(boxes[idx]))
+        return final_boxes
+
+    def process(self, rgb_crop):
+        """Chạy FaceMesh Refined (478 pts) ONNX. Giả lập API của MediaPipe."""
+        if rgb_crop is None or rgb_crop.size == 0: return None
+        
+        # Preprocess: 192x192 (rgb_crop đã là RGB từ process_frame)
+        img = cv2.resize(rgb_crop, (192, 192))
+        img = img.astype(np.float32) / 255.0
+        img = np.expand_dims(img, axis=0) # [1, 192, 192, 3]
+
+        outputs = self.ort_mesh.run(None, {self.mesh_input: img})
+        
+        # Giải mã: refined model có 3 outputs: mesh(468), l_iris(5), r_iris(5)
+        mesh_raw = outputs[0].reshape(-1, 3) # [468, 3]
+        l_iris = outputs[1].reshape(-1, 2)   # [5, 2]
+        r_iris = outputs[2].reshape(-1, 2)   # [5, 2]
+        
+        # Ghép thành 478 điểm
+        full_lms = np.zeros((478, 3), dtype=np.float32)
+        full_lms[:468] = mesh_raw
+        
+        # Map Iris (468-472: Left, 473-477: Right)
+        for i in range(5):
+            full_lms[468 + i] = [l_iris[i, 0], l_iris[i, 1], 0]
+            full_lms[473 + i] = [r_iris[i, 0], r_iris[i, 1], 0]
+            
+        # Mock class tương đương mediapipe landmark object
+        class Point:
+            def __init__(self, x, y, z): self.x, self.y, self.z = x, y, z
+        class LandmarkList:
+            def __init__(self, lms): self.landmark = [Point(p[0]/192, p[1]/192, p[2]/192) for p in lms]
+        class Result:
+            def __init__(self, ml, mw): self.multi_face_landmarks = [ml]; self.multi_face_world_landmarks = [mw]
+
+        # Landmark pixel (scale 0-1 relative to 192x192)
+        ml = LandmarkList(full_lms)
+        # World landmark (Tận dụng tọa độ 3D của model)
+        mw = LandmarkList(full_lms) 
+        
+        return Result(ml, mw)
 
 
 def calculate_iou(b1, b2):
@@ -169,34 +357,31 @@ def make_face_mesh(static=False):
         min_tracking_confidence  = 0.60, # Tăng lên để bám landmark chặt chẽ hơn
     )
 
-def preprocess_face(crop, min_dim=384):
-    """
-    Two-Stage Eye Refinement - Bước tiền xử lý ảnh khuôn mặt:
-    1. Upscale: Đảm bảo crop đủ lớn (≥min_dim) để MediaPipe có nhiều pixel hơn 
-       cho vùng mắt, giúp landmark iris/eyelid chính xác hơn đáng kể.
-    2. CLAHE: Tăng cường tương phản kênh Lightness (LAB) để nổi bật viền mắt.
-    3. Sharpen: Làm sắc nét cạnh mí mắt/mống mắt để MediaPipe snap chính xác hơn.
-    
-    QUAN TRỌNG: Hàm trả về (processed_crop, orig_w, orig_h) để caller 
-    có thể dùng orig_w/h cho build_coords, tránh lỗi mapping tọa độ pixel.
-    """
+def preprocess_face(crop, min_dim=None):
     import cv2
     import numpy as np
     if crop is None or crop.size == 0: return crop, 0, 0
     
+    # Lấy min_dim từ config nếu không truyền vào
+    if min_dim is None:
+        min_dim = 256 if GLOBAL_CONFIG.get("high_fps_mode", False) else 384
+
     orig_h, orig_w = crop.shape[:2]
     
-    # 1. UPSCALE (Two-Stage Eye Refinement core)
-    # Nếu crop quá nhỏ, upscale lên để MediaPipe có nhiều pixel/mắt hơn.
-    # Kích thước gốc (orig_w, orig_h) phải được trả về để build_coords dùng,
-    # vì MediaPipe chuẩn hóa landmark về [0,1] relative to input → cần map về đúng orig frame size.
+    # 1. UPSCALE
     current_max = max(orig_h, orig_w)
     if current_max < min_dim:
         scale = min_dim / current_max
         new_w, new_h = int(orig_w * scale), int(orig_h * scale)
-        crop = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+        # INTER_NEAREST nhanh hơn INTER_CUBIC
+        interp = cv2.INTER_NEAREST if GLOBAL_CONFIG.get("high_fps_mode", False) else cv2.INTER_CUBIC
+        crop = cv2.resize(crop, (new_w, new_h), interpolation=interp)
     
-    # 2. CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    # Nếu HIGH_FPS_MODE=True, bỏ qua CLAHE và Sharpen để cứu CPU
+    if GLOBAL_CONFIG.get("high_fps_mode", False):
+        return crop, orig_w, orig_h
+
+    # 2. CLAHE
     lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
@@ -405,7 +590,9 @@ def draw_hud(frame, fps, yaw, pitch, show_mesh, show_ids):
     ov = frame.copy()
     cv2.rectangle(ov, (10,10), (330,135), (0,0,0), -1)
     cv2.addWeighted(ov, 0.4, frame, 0.6, 0, frame)
-    cv2.putText(frame, f"FPS: {fps:.1f}", (20,35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+    st_fps = "HighPerf" if GLOBAL_CONFIG["high_fps_mode"] else "Normal"
+    st_eng = "ONNX" if GLOBAL_CONFIG.get("use_onnx", True) else "M-Pipe"
+    cv2.putText(frame, f"FPS: {fps:.1f} ({st_fps}|{st_eng})", (20,35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0) if st_fps=="Normal" else (255, 255, 0), 2)
     cv2.putText(frame, f"Yaw:   {yaw:.1f} deg" if yaw is not None else "Yaw:   --", (20,62), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
     cv2.putText(frame, f"Pitch: {pitch:.1f} deg" if pitch is not None else "Pitch: --", (20,87), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
     cv2.putText(frame, f"Mesh:{'ON' if show_mesh else 'OFF'} IDs:{'ON' if show_ids else 'OFF'}", (20,112), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200,200,200), 1)
@@ -508,33 +695,43 @@ def run_batch():
     print("[DONE] Batch hoàn thành.\n")
 
 # ------------------------------------------------------------------ #
-#  CHẾ ĐỘ 2 - WEBCAM                                                  #
+#  CHẾ ĐỘ 2 - WEBCAM (THREADED CAMERA)                                #
 # ------------------------------------------------------------------ #
 def run_webcam():
-    from ultralytics import YOLO
     print("\n[MODE] Webcam Real-time")
     dev = get_device()
-    print(f"  [*] Khởi tạo Face Detection trên: {dev.upper()}")
-    yolo = YOLO(str(YOLO_FACE_MODEL)).to(dev)
-    print("  [*] Khởi tạo Landmark Extractor trên: Per-Face Instances")
-    # Thử mở camera với các backend khác nhau nếu lỗi
-    cap = cv2.VideoCapture(CAMERA_ID, cv2.CAP_DSHOW) if sys.platform == "win32" else cv2.VideoCapture(CAMERA_ID)
-    if not cap.isOpened():
-        cap = cv2.VideoCapture(CAMERA_ID) # Fallback
-        if not cap.isOpened():
-            print(f"  [ERR] Không mở được camera ID {CAMERA_ID}."); return
-            
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT,  720)
+    use_onnx = GLOBAL_CONFIG.get("use_onnx", True)
     
-    # Một số camera cần thời gian khởi động
+    # 1. Khởi tạo Engine
+    onnx_engine = None
+    yolo_model = None
+    if use_onnx:
+        try:
+            onnx_engine = ONNXGazeEngine()
+            print("  [✓] Đã khởi tạo ONNX GPU Engine.")
+        except Exception as e:
+            print(f"  [!] Lỗi khởi tạo ONNX: {e}. Fallback sang MediaPipe.")
+            use_onnx = False
+
+    if not use_onnx:
+        from ultralytics import YOLO
+        print(f"  [*] Khởi tạo MediaPipe + YOLO trên: {dev.upper()}")
+        yolo_model = YOLO(str(YOLO_FACE_MODEL)).to(dev)
+
+    # 2. Khởi tạo Camera
+    cam = ThreadedCamera(CAMERA_ID)
+    if not cam.cap.isOpened():
+        print(f"  [ERR] Không mở được camera ID {CAMERA_ID}."); return
+
     print("  [*] Đang khởi động camera...")
     for _ in range(15):
-        ret, _ = cap.read()
-        if ret: break
+        grabbed, _ = cam.read()
+        if grabbed: break
         time.sleep(0.1)
-    
-    if not ret: print("  [ERR] Camera không truyền được dữ liệu."); cap.release(); return
+    if not grabbed:
+        print("  [ERR] Camera không truyền được dữ liệu."); cam.stop(); return
+
+    cam.start()
     print("  [*] Webcam đã sẵn sàng.")
 
     show_mesh, show_ids = True, GLOBAL_CONFIG["show_ids"]
@@ -545,40 +742,74 @@ def run_webcam():
     tracker = FaceTracker()
     last_tracked_faces = []
     frame_idx = 0
-    fm_shared = None # Shared mesh for Fast Mode
-    
-    while True:
-        try:
-            ret, frame = cap.read()
-            if not ret or frame is None: break
+    fm_shared = None
+
+    try:
+        while True:
+            grabbed, frame = cam.read()
+            if not grabbed or frame is None: break
             frame_idx += 1
-            
-            # Decide Mode
+
+            t_start = time.time()
             multi = GLOBAL_CONFIG["multi_face"]
+            t_yolo = 0
+            
+            # 3. Detection & Inference Pipeline
             if multi:
-                if frame_idx % 5 == 0 or not last_tracked_faces:
-                    res = yolo(frame, conf=GLOBAL_CONFIG["yolo_conf"], imgsz=640, verbose=False)[0]
-                    last_tracked_faces = tracker.update(res.boxes)
-                rows, _ = process_frame(frame, last_tracked_faces, tracker=tracker, show_mesh=show_mesh, show_ids=show_ids)
+                interval = GLOBAL_CONFIG.get("detect_interval", 3)
+                if frame_idx % interval == 0 or not last_tracked_faces:
+                    t0 = time.time()
+                    if use_onnx:
+                        boxes = onnx_engine.detect(frame, conf_threshold=GLOBAL_CONFIG["yolo_conf"])
+                    else:
+                        res = yolo_model(frame, conf=GLOBAL_CONFIG["yolo_conf"], imgsz=640, verbose=False)[0]
+                        boxes = res.boxes
+                    last_tracked_faces = tracker.update(boxes)
+                    t_yolo = (time.time() - t0) * 1000
+                
+                # Truyền onnx_engine vào process_frame nếu cần
+                rows, _ = process_frame(frame, last_tracked_faces, tracker=tracker, 
+                                        face_mesh=onnx_engine if use_onnx else None, 
+                                        show_mesh=show_mesh, show_ids=show_ids)
             else:
-                # Fast Mode: Only largest face, no tracker
-                if not fm_shared: fm_shared = make_face_mesh(static=False)
-                res = yolo(frame, conf=GLOBAL_CONFIG["yolo_conf"], imgsz=320, verbose=False)[0]
-                if res.boxes:
-                    # Pick largest face
-                    best_box = max(res.boxes, key=lambda b: (b.xyxy[0][2]-b.xyxy[0][0])*(b.xyxy[0][3]-b.xyxy[0][1]))
-                    rows, _ = process_frame(frame, [(best_box, 0)], face_mesh=fm_shared, show_mesh=show_mesh, show_ids=show_ids)
+                # Fast Mode (Single Face)
+                if not use_onnx and not fm_shared: fm_shared = make_face_mesh(static=False)
+                t0 = time.time()
+                if use_onnx:
+                    boxes = onnx_engine.detect(frame, conf_threshold=GLOBAL_CONFIG["yolo_conf"])
+                else:
+                    res = yolo_model(frame, conf=GLOBAL_CONFIG["yolo_conf"], imgsz=320, verbose=False)[0]
+                    boxes = res.boxes
+                t_yolo = (time.time() - t0) * 1000
+                
+                if boxes:
+                    # Lấy mặt to nhất
+                    if use_onnx:
+                        # boxes ở đây là list FakeBox
+                        best_box = max(boxes, key=lambda b: (b.xyxy[0][2]-b.xyxy[0][0])*(b.xyxy[0][3]-b.xyxy[0][1]))
+                    else:
+                        best_box = max(boxes, key=lambda b: (b.xyxy[0][2]-b.xyxy[0][0])*(b.xyxy[0][3]-b.xyxy[0][1]))
+                    
+                    rows, _ = process_frame(frame, [(best_box, 0)], 
+                                            face_mesh=onnx_engine if use_onnx else fm_shared, 
+                                            show_mesh=show_mesh, show_ids=show_ids)
                 else: rows = []
 
             if rows:
                 last_a, last_d = rows[-1]['yaw_deg'], rows[-1]['pitch_deg']
 
+            t_total = (time.time() - t_start) * 1000
             fps = 1/(time.time()-prev_t+1e-9); prev_t = time.time()
+            
+            # Print profiling every 30 frames
+            if frame_idx % 30 == 0:
+                print(f"  [PROFILE] Total: {t_total:.1f}ms | YOLO: {t_yolo:.1f}ms | FPS: {fps:.1f}")
+
             draw_hud(frame, fps, last_a, last_d, show_mesh, show_ids)
             cv2.imshow("Gaze Estimation - Webcam", frame)
-            
+
             k = cv2.waitKey(1) & 0xFF
-            if k in (ord('q'), 27): 
+            if k in (ord('q'), 27):
                 print("  [*] Thoát theo yêu cầu (Q/ESC).")
                 break
             elif k == ord('s'):
@@ -587,18 +818,17 @@ def run_webcam():
                 cv2.imwrite(str(p), frame); print(f"  [✓] Lưu: {p.name}")
             elif k == ord('m'): show_mesh = not show_mesh
             elif k == ord('i'): show_ids  = not show_ids
-            
+
             if cv2.getWindowProperty("Gaze Estimation - Webcam", cv2.WND_PROP_VISIBLE) < 1:
                 break
-                
-        except Exception as e:
-            print(f"  [ERR] Lỗi khi xử lý frame: {e}")
-            import traceback
-            traceback.print_exc()
-            break
 
-    if fm_shared: fm_shared.close()
-    cap.release(); cv2.destroyAllWindows()
+    except Exception as e:
+        print(f"  [ERR] Lỗi khi xử lý frame: {e}")
+        import traceback; traceback.print_exc()
+    finally:
+        if fm_shared: fm_shared.close()
+        cam.stop()
+        cv2.destroyAllWindows()
     print("[DONE] Webcam đã đóng.\n")
 
 # ------------------------------------------------------------------ #
@@ -942,11 +1172,26 @@ def run_video():
 
 
     dev = get_device()
-    print(f"  [*] Khởi tạo Face Detection trên: {dev.upper()}")
-    yolo = YOLO(str(YOLO_FACE_MODEL)).to(dev)
-    print("  [*] Khởi tạo Landmark Extractor trên: CPU (MediaPipe)")
-    fm   = make_face_mesh(static=False)
+    use_onnx = GLOBAL_CONFIG.get("use_onnx", True)
     
+    # 1. Khởi tạo Engine
+    onnx_engine = None
+    yolo_model = None
+    fm_mp = None
+    
+    if use_onnx:
+        try:
+            onnx_engine = ONNXGazeEngine()
+            print("  [✓] Đã khởi tạo ONNX GPU Engine.")
+        except Exception as e:
+            print(f"  [!] Lỗi khởi tạo ONNX: {e}. Fallback sang MediaPipe.")
+            use_onnx = False
+
+    if not use_onnx:
+        yolo_model = YOLO(str(YOLO_FACE_MODEL)).to(dev)
+        fm_mp = make_face_mesh(static=False)
+        print(f"  [*] Khởi tạo MediaPipe + YOLO trên: {dev.upper()}")
+
     print("\n  [?] Chọn chế độ xử lý:")
     print("      1. Fast Mode (720p, High FPS, Có Preview)")
     print("      2. Ultra-Safe (Low-res, No-Preview, Ổn định cao)")
@@ -954,6 +1199,7 @@ def run_video():
     
     use_preview = (safe_choice != "2")
     yolo_imgsz = 320 if safe_choice == "2" else 640
+    # ... logic tiếp theo sử dụng engine đã chọn
     MAX_PROC_W = 640 if safe_choice == "2" else 1080
 
     for idx, vpath in enumerate(to_process):
@@ -995,17 +1241,35 @@ def run_video():
 
                 multi = GLOBAL_CONFIG["multi_face"]
                 if multi:
-                    yolo_step = 5 if safe_choice == "2" else 3
-                    if curr_f % yolo_step == 0 or not last_tracked:
-                        res = yolo(frame, conf=GLOBAL_CONFIG["yolo_conf"], imgsz=yolo_imgsz, verbose=False)[0]
-                        last_tracked = tracker.update(res.boxes)
-                    rows, _ = process_frame(frame, last_tracked, tracker=tracker, show_mesh=show_mesh, show_ids=show_ids)
+                    interval = GLOBAL_CONFIG.get("detect_interval", 3)
+                    if curr_f % interval == 0 or not last_tracked:
+                        if use_onnx:
+                            boxes = onnx_engine.detect(frame, conf_threshold=GLOBAL_CONFIG["yolo_conf"])
+                        else:
+                            res = yolo_model(frame, conf=GLOBAL_CONFIG["yolo_conf"], imgsz=yolo_imgsz, verbose=False)[0]
+                            boxes = res.boxes
+                        last_tracked = tracker.update(boxes)
+                    rows, _ = process_frame(frame, last_tracked, tracker=tracker, 
+                                            face_mesh=onnx_engine if use_onnx else None, 
+                                            show_mesh=show_mesh, show_ids=show_ids)
                 else:
-                    if not fm_shared: fm_shared = make_face_mesh(static=False)
-                    res = yolo(frame, conf=GLOBAL_CONFIG["yolo_conf"], imgsz=yolo_imgsz, verbose=False)[0]
-                    if res.boxes:
-                        best_box = max(res.boxes, key=lambda b: (b.xyxy[0][2]-b.xyxy[0][0])*(b.xyxy[0][3]-b.xyxy[0][1]))
-                        rows, _ = process_frame(frame, [(best_box, 0)], face_mesh=fm_shared, show_mesh=show_mesh, show_ids=show_ids)
+                    # Fast Mode (Single Face)
+                    if not use_onnx and not fm_mp: fm_mp = make_face_mesh(static=False)
+                    if use_onnx:
+                        boxes = onnx_engine.detect(frame, conf_threshold=GLOBAL_CONFIG["yolo_conf"])
+                    else:
+                        res = yolo_model(frame, conf=GLOBAL_CONFIG["yolo_conf"], imgsz=yolo_imgsz, verbose=False)[0]
+                        boxes = res.boxes
+                        
+                    if boxes:
+                        if use_onnx:
+                            best_box = max(boxes, key=lambda b: (b.xyxy[0][2]-b.xyxy[0][0])*(b.xyxy[0][3]-b.xyxy[0][1]))
+                        else:
+                            best_box = max(boxes, key=lambda b: (b.xyxy[0][2]-b.xyxy[0][0])*(b.xyxy[0][3]-b.xyxy[0][1]))
+                            
+                        rows, _ = process_frame(frame, [(best_box, 0)], 
+                                                face_mesh=onnx_engine if use_onnx else fm_mp, 
+                                                show_mesh=show_mesh, show_ids=show_ids)
                     else: rows = []
 
                 # Tính FPS xử lý
@@ -1075,16 +1339,87 @@ def run_settings_menu():
         print(f"  1. Smooth Alpha [{GLOBAL_CONFIG['smooth_alpha']}]")
         print(f"  2. YOLO Conf [{GLOBAL_CONFIG['yolo_conf']}]")
         print(f"  3. ROI Padding [{GLOBAL_CONFIG['roi_padding']}]")
+        print(f"  4. Detect Interval [{GLOBAL_CONFIG['detect_interval']}] (mỗi N frame)")
+        print(f"  5. High FPS Mode [{'BẬT' if GLOBAL_CONFIG['high_fps_mode'] else 'TẮT'}]")
+        print(f"  6. Engine: [{'ONNX (GPU)' if GLOBAL_CONFIG['use_onnx'] else 'MediaPipe (CPU)'}]")
         print(f"  0. Quay lại")
         c = input("\nChọn: ").strip()
         if c == '0': break
         try:
-            v = float(input("Nhập giá trị mới: "))
+            if c == '5':
+                GLOBAL_CONFIG['high_fps_mode'] = not GLOBAL_CONFIG['high_fps_mode']
+                print("  [OK]")
+                continue
+            if c == '6':
+                GLOBAL_CONFIG['use_onnx'] = not GLOBAL_CONFIG['use_onnx']
+                print("  [OK]")
+                continue
+
+            v_str = input("Nhập giá trị mới: ")
+            v = float(v_str)
             if c == '1': GLOBAL_CONFIG['smooth_alpha'] = v
             elif c == '2': GLOBAL_CONFIG['yolo_conf'] = v
             elif c == '3': GLOBAL_CONFIG['roi_padding'] = v
+            elif c == '4': GLOBAL_CONFIG['detect_interval'] = int(v)
             print("  [OK]")
         except: print("  [!]")
+
+def run_status_report():
+    import platform
+    import onnxruntime as ort
+    import torch
+    
+    print(f"\n{'='*55}")
+    print(f"{'HỆ THỐNG GAZE ESTIMATION - THÔNG TIN CHI TIẾT':^55}")
+    print(f"{'='*55}")
+    
+    # 1. PHẦN MỀM & PHẦN CỨNG
+    print("\n[1] MÔI TRƯỜNG & PHẦN MỀM")
+    print(f"  - OS:           {platform.system()} {platform.release()}")
+    print(f"  - Python:       {platform.python_version()}")
+    print(f"  - OpenCV:       {cv2.__version__}")
+    print(f"  - ONNX Runtime: {ort.__version__}")
+    print(f"  - PyTorch:      {torch.__version__}")
+    print(f"  - CUDA:         {'CÓ (Sẵn sàng)' if torch.cuda.is_available() else 'KHÔNG (CPU Mode)'}")
+    if torch.cuda.is_available():
+        print(f"  - GPU Device:   {torch.cuda.get_device_name(0)}")
+    
+    # 2. CẤU HÌNH INFERENCE
+    print("\n[2] CẤU HÌNH INFERENCE (GLOBAL_CONFIG)")
+    print(f"  - Engine:       {'ONNX Runtime (GPU)' if GLOBAL_CONFIG['use_onnx'] else 'MediaPipe (CPU/Fallback)'}")
+    print(f"  - Strategy:     {'Robust (Multi-Face)' if GLOBAL_CONFIG['multi_face'] else 'Fast (Single-Face)'}")
+    print(f"  - Device Force: {GLOBAL_CONFIG['force_device'].upper()}")
+    print(f"  - YOLO Conf:    {GLOBAL_CONFIG['yolo_conf']}")
+    print(f"  - Detect Int:   {GLOBAL_CONFIG['detect_interval']} frames (YOLO Skip)")
+    print(f"  - High FPS:     {'BẬT (256px, No-PP)' if GLOBAL_CONFIG['high_fps_mode'] else 'TẮT (384px, CLAHE+Sharp)'}")
+    
+    # 3. THÔNG SỐ HÌNH HỌC (GAZE GEOMETRY)
+    print("\n[3] THÔNG SỐ HÌNH HỌC & LÀM MƯỢT")
+    print(f"  - Smooth Alpha: {GLOBAL_CONFIG['smooth_alpha']} (Smoothing strength)")
+    print(f"  - ROI Padding:  {GLOBAL_CONFIG['roi_padding']} (Crop buffer)")
+    print(f"  - Gaze Mode:    {'Mặt + Mống mắt' if GLOBAL_CONFIG['use_eye_gaze'] else 'Chỉ hướng mặt'}")
+    print(f"  - Show IDs:     {GLOBAL_CONFIG['show_ids']}")
+    
+    # 4. TRẠNG THÁI MÔ HÌNH (MODEL FILES)
+    print("\n[4] KIỂM TRA TỆP MÔ HÌNH")
+    models = {
+        "YOLO PT": BASE_DIR / "yolov8_head" / "yolov8n-face.pt",
+        "YOLO ONNX": BASE_DIR / "c_ver" / "yolov8n-face.onnx",
+        "FaceMesh ONNX": BASE_DIR / "c_ver" / "facemesh_refined.onnx"
+    }
+    for name, path in models.items():
+        status = "OK" if path.exists() else "THIẾU"
+        size = f"({path.stat().st_size/1024/1024:.1f} MB)" if path.exists() else ""
+        print(f"  - {name:<14}: {status} {size}")
+
+    # 5. ĐƯỜNG DẪN DỮ LIỆU
+    print("\n[5] ĐƯỜNG DẪN (DIRECTORIES)")
+    print(f"  - Input Dir:    {INPUT_DIR.relative_to(BASE_DIR)}")
+    print(f"  - Video Output: {OUTPUT_VIDEO.relative_to(BASE_DIR)}")
+    print(f"  - Data Log:     {DATA_DIR.relative_to(BASE_DIR)}")
+
+    print(f"\n{'='*55}")
+    input("Nhấn ENTER để quay lại menu chính...")
 
 # ------------------------------------------------------------------ #
 #  MENU                                                                #
@@ -1094,9 +1429,13 @@ def get_menu():
     st_gaze = "Mặt+Mắt" if GLOBAL_CONFIG["use_eye_gaze"] else "Chỉ Mặt"
     st_mode = "Robust" if GLOBAL_CONFIG["multi_face"] else "Fast"
     dev = GLOBAL_CONFIG["force_device"].upper()
+    hw = GLOBAL_CONFIG["hw_detected"]
+    
     return f"""
 ╔══════════════════════════════════════════╗
 ║    GEOMETRIC GAZE ESTIMATION             ║
+╠══════════════════════════════════════════╣
+║ Hardware: {hw:<31}║
 ╠══════════════════════════════════════════╣
 ║  1  Batch  (ảnh trong input/)            ║
 ║  2  Webcam (real-time camera)            ║
@@ -1108,6 +1447,7 @@ def get_menu():
 ║  8  Thiết bị [{dev}]                     ║
 ║  9  Chế độ [{st_mode}] (Robust/Fast)     ║
 ║  S  Cài đặt tham số nâng cao             ║
+║  D  Thông số hệ thống chi tiết           ║
 ║  0  Thoát                                ║
 ╚══════════════════════════════════════════╝
 Chọn: """
@@ -1121,7 +1461,8 @@ HANDLERS = {
     '7': run_toggle_gaze_mode,
     '8': run_toggle_device,
     '9': run_toggle_multi_face, # Phím 9 chuyển mode
-    'S': run_settings_menu      # Phím S cho cài đặt
+    'S': run_settings_menu,     # Phím S cho cài đặt
+    'D': run_status_report      # Phím D cho cấu hình chi tiết
 }
 
 if __name__ == "__main__":

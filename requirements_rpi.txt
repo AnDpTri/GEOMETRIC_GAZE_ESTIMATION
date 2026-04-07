@@ -1,0 +1,25 @@
+# Core Dependencies (Raspberry Pi 4 / ARM optimized)
+# To install: pip install -r requirements_rpi.txt
+
+# Computer Vision & ML
+opencv-python==4.13.0.92
+numpy==2.0.2
+mediapipe==0.10.9
+ultralytics==8.4.21
+
+# Inference Engine (CPU-only version for ARM)
+onnxruntime==1.19.2
+
+# Math & Signal Processing
+scipy==1.13.1
+filterpy==1.4.5
+
+# Visualization & Data
+plotly==6.6.0
+matplotlib==3.9.4
+pandas==2.3.3
+
+# Deep Learning (Standard CPU versions)
+torch==2.5.1
+torchvision==0.20.1
+torchaudio==2.5.1

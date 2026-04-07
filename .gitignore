@@ -34,10 +34,26 @@ ENV/
 input/
 output/
 data/
-yolov8_head/*.pt
-yolov8_head/*.pth
+
+# Model weights (Large files)
+*.pt
+*.pth
+*.onnx
+*.weights
+*.tflite
+
+# Media
 *.mp4
 *.avi
 *.mkv
-*.csv
-!requirements.txt
+*.mov
+*.jpg
+*.png
+*.gif
+
+# Exclude specific non-source files
+!requirements.txt
+!requirements_rpi.txt
+!README_VN.md
+!setup_pc.bat
+!setup_rpi.sh
